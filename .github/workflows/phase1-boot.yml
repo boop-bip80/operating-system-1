@@ -12,7 +12,8 @@ permissions:
 
 concurrency:
   group: phase1-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  # A newer push supersedes an obsolete build; completed attempts remain visible.
+  cancel-in-progress: true
 
 jobs:
   build-and-boot:
