@@ -7,10 +7,11 @@ PHASE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 REPO_ROOT=$(cd -- "$PHASE_DIR/../.." && pwd -P)
 OUTPUT_DIR="$REPO_ROOT/.build/phase1"
 KERNEL_BUILD_DIR="$OUTPUT_DIR/kernel"
+KERNEL_UAPI_DIR="$OUTPUT_DIR/kernel-uapi"
 BUSYBOX_BUILD_DIR="$OUTPUT_DIR/busybox-build"
 BUSYBOX_SOURCE_DIR="$OUTPUT_DIR/busybox-src"
 DOWNLOAD_DIR="$OUTPUT_DIR/downloads"
-export KERNEL_BUILD_DIR BUSYBOX_BUILD_DIR BUSYBOX_SOURCE_DIR
+export KERNEL_BUILD_DIR KERNEL_UAPI_DIR BUSYBOX_BUILD_DIR BUSYBOX_SOURCE_DIR
 
 phase1_die() { printf 'phase1: ERROR: %s\n' "$*" >&2; exit 1; }
 phase1_log() { printf 'phase1: %s\n' "$*"; }

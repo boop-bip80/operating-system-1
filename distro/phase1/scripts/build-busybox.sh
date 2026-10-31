@@ -5,7 +5,7 @@ set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
-for tool in musl-gcc gcc make curl tar sha256sum readelf install tee grep sed awk; do
+for tool in musl-gcc gcc make rsync curl tar sha256sum readelf install tee grep sed awk; do
     phase1_require "$tool"
 done
 
@@ -17,11 +17,26 @@ done
 [[ "$BUSYBOX_URL" == https://* ]] || phase1_die "AC-04: BusyBox downloads require HTTPS"
 
 phase1_prepare_output
-for directory in "$DOWNLOAD_DIR" "$BUSYBOX_SOURCE_DIR" "$BUSYBOX_BUILD_DIR" "$OUTPUT_DIR/rootfs"; do
+for directory in "$DOWNLOAD_DIR" "$BUSYBOX_SOURCE_DIR" "$BUSYBOX_BUILD_DIR" "$KERNEL_UAPI_DIR" "$OUTPUT_DIR/rootfs"; do
     [[ ! -L "$directory" ]] || phase1_die "AC-04: refusing a symlink output directory: $directory"
 done
 mkdir -p "$DOWNLOAD_DIR" "$BUSYBOX_BUILD_DIR" "$OUTPUT_DIR/logs" "$OUTPUT_DIR/rootfs"
 exec > >(tee "$OUTPUT_DIR/logs/build-busybox.log") 2>&1
+
+# musl-gcc intentionally does not search the host glibc header tree. BusyBox's
+# networking applets need Linux UAPI headers; export them from this repository's
+# kernel rather than mixing /usr/include glibc headers into a static musl build.
+phase1_log "Exporting repository Linux UAPI headers for static BusyBox"
+make -C "$REPO_ROOT" O="$KERNEL_BUILD_DIR" ARCH=x86_64 \
+    INSTALL_HDR_PATH="$KERNEL_UAPI_DIR" headers_install
+for header in linux/types.h linux/netlink.h asm/types.h; do
+    phase1_assert_regular "$KERNEL_UAPI_DIR/include/$header"
+done
+uapi_cflags="-I$KERNEL_UAPI_DIR/include"
+if ! printf '#include <linux/types.h>\n#include <linux/netlink.h>\n#include <asm/types.h>\nint main(void) { return 0; }\n' | \
+    musl-gcc "$uapi_cflags" -x c -fsyntax-only -; then
+    phase1_die 'AC-04: musl-gcc cannot compile against exported repository Linux UAPI headers'
+fi
 
 archive="$DOWNLOAD_DIR/busybox-${BUSYBOX_VERSION}.tar.bz2"
 temporary_archive=""
@@ -77,7 +92,7 @@ export SOURCE_DATE_EPOCH
 export KCONFIG_NOTIMESTAMP=1
 export LC_ALL=C
 export TZ=UTC
-make_args=(-C "$BUSYBOX_SOURCE_DIR" "O=$BUSYBOX_BUILD_DIR" ARCH=x86_64 CC=musl-gcc HOSTCC=gcc CROSS_COMPILE=)
+make_args=(-C "$BUSYBOX_SOURCE_DIR" "O=$BUSYBOX_BUILD_DIR" ARCH=x86_64 CC=musl-gcc HOSTCC=gcc CROSS_COMPILE= "EXTRA_CFLAGS=$uapi_cflags")
 
 phase1_log "Configuring minimal static musl BusyBox"
 make "${make_args[@]}" allnoconfig

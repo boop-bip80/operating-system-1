@@ -17,6 +17,11 @@ The guest also prints the embedded expected source identity and its actual
 `uname -r`; the host validates both against the generated build metadata.
 The build scripts compile the kernel in this tree and do not copy a distro
 kernel from `/boot` or from the host machine.
+Before compiling static BusyBox with `musl-gcc`, the userspace builder exports
+Linux UAPI headers from this same kernel tree into `.build/phase1/kernel-uapi`
+using `headers_install`. It checks that the required headers exist and probes
+their use with `musl-gcc`. BusyBox receives that include directory through
+`EXTRA_CFLAGS`; it does not borrow glibc's `/usr/include` headers.
 
 ## Pinned inputs and toolchain records
 
