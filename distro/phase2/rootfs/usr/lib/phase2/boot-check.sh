@@ -58,8 +58,9 @@ done
 ip -4 route show default | grep -q '^default via 10\.0\.2\.2 '
 ping -c 1 -W 3 10.0.2.2
 emit NETWORK_OK
-reason=NO_DRM
+reason=UDEV
 udevadm settle --timeout=30
+reason=NO_DRM
 drm_found=false
 shopt -s nullglob
 for card in /sys/class/drm/card[0-9]*; do

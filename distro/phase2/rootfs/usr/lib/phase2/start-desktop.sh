@@ -7,7 +7,7 @@ weston_pid=
 terminal_pid=
 terminal_shell_pid=
 log_pid=
-# shellcheck disable=SC2329 # Called by the EXIT trap, including signal exits.
+# shellcheck disable=SC2317,SC2329 # Called by the EXIT trap, including signal exits.
 cleanup() {
     trap - EXIT
     for child in "$terminal_pid" "$weston_pid" "$log_pid"; do
