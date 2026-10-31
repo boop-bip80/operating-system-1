@@ -156,6 +156,52 @@ class OutputSafetyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "set:")
 
+    def keyring_fixture(self):
+        self.prepare()
+        extraction = self.out / "downloads" / "debian-keyring-2025.1.fixture"
+        keys = extraction / "usr/share/keyrings"
+        keys.mkdir(parents=True)
+        return extraction, keys
+
+    def copy_keyring(self, extraction):
+        # Execute the actual short copy block, not a duplicate implementation.
+        # This isolates package-layout handling from root/chroot/download work.
+        script = (PHASE / "scripts/build-rootfs.sh").read_text()
+        start = script.index('archive_keyring_source=')
+        end = script.index('\n\n', start)
+        block = script[start:end]
+        return self.run_guard('keyring_dir=$1\n' + block, extraction)
+
+    def test_keyring_compatibility_symlink_uses_real_regular_pgp(self):
+        extraction, keys = self.keyring_fixture()
+        source = keys / "debian-archive-keyring.pgp"
+        source.write_bytes(b"verified-package keyring fixture")
+        (keys / "debian-archive-keyring.gpg").symlink_to(source.name)
+        result = self.copy_keyring(extraction)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copy = extraction / "bootstrap-keyring.gpg"
+        self.assertFalse(copy.is_symlink())
+        self.assertEqual(copy.stat().st_nlink, 1)
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(copy.read_bytes(), source.read_bytes())
+
+    def test_real_keyring_symlink_is_still_rejected(self):
+        extraction, keys = self.keyring_fixture()
+        source = Path(self.temporary.name) / "external-keyring"
+        source.write_bytes(b"not the extracted regular keyring")
+        (keys / "debian-archive-keyring.pgp").symlink_to(source)
+        self.assertNotEqual(self.copy_keyring(extraction).returncode, 0)
+        self.assertFalse((extraction / "bootstrap-keyring.gpg").exists())
+
+    def test_bootstrap_keyring_destination_symlink_is_rejected(self):
+        extraction, keys = self.keyring_fixture()
+        (keys / "debian-archive-keyring.pgp").write_bytes(b"keyring fixture")
+        sentinel = Path(self.temporary.name) / "sentinel"
+        sentinel.write_bytes(b"do not change")
+        (extraction / "bootstrap-keyring.gpg").symlink_to(sentinel)
+        self.assertNotEqual(self.copy_keyring(extraction).returncode, 0)
+        self.assertEqual(sentinel.read_bytes(), b"do not change")
+
 
 class LockedInputsTests(unittest.TestCase):
     def test_partition_and_filesystem_ids_are_unique_uuids(self):

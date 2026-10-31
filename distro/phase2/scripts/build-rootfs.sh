@@ -32,7 +32,13 @@ printf '%s  %s\n' "$DEBIAN_KEYRING_SHA256" "$keyring_deb" | sha256sum --check --
 keyring_dir=$(mktemp -d -- "$DOWNLOAD_DIR/debian-keyring-${DEBIAN_KEYRING_VERSION}.XXXXXX")
 chmod 755 "$keyring_dir"
 dpkg-deb --extract "$keyring_deb" "$keyring_dir"
-archive_keyring="$keyring_dir/usr/share/keyrings/debian-archive-keyring.gpg"
+# Debian 2025.1 ships the real bytes as .pgp and a compatibility .gpg symlink.
+# Validate the real file, then give older host APT a regular .gpg-named copy.
+archive_keyring_source="$keyring_dir/usr/share/keyrings/debian-archive-keyring.pgp"
+phase2_assert_regular "$archive_keyring_source"
+archive_keyring="$keyring_dir/bootstrap-keyring.gpg"
+phase2_output_file "$archive_keyring"
+install -m 644 "$archive_keyring_source" "$archive_keyring"
 phase2_assert_regular "$archive_keyring"
 
 # Check-Valid-Until is disabled only for these immutable archived indices;
