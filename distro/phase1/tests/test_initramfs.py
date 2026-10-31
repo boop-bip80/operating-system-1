@@ -43,7 +43,8 @@ def boot_entries():
     return [
         {"name": "init", "data": b"#!/bin/sh\nprintf hello\n"},
         {"name": "bin/busybox", "data": b"\x7fELFmock-validated-elsewhere"},
-        {"name": "bin/sh", "data": b"busybox", "mode": stat.S_IFLNK | 0o777},
+        # Match the exact payload emitted by this kernel's gen_init_cpio.
+        {"name": "bin/sh", "data": b"busybox\x00", "mode": stat.S_IFLNK | 0o777},
         {"name": "etc/udhcpc.script", "data": b"#!/bin/sh\n"},
         {"name": "dev/console", "mode": stat.S_IFCHR | 0o600, "major": 5, "minor": 1},
         {"name": "dev/null", "mode": stat.S_IFCHR | 0o666, "major": 1, "minor": 3},
@@ -147,8 +148,25 @@ class TestBootArchiveContract(unittest.TestCase):
 
     def test_absolute_busybox_shell_target_allowed(self):
         entries = boot_entries()
-        entries[2]["data"] = b"/bin/busybox"
+        entries[2]["data"] = b"/bin/busybox\x00"
         verify(entries)
+
+    def test_non_terminated_busybox_shell_target_allowed(self):
+        entries = boot_entries()
+        entries[2]["data"] = b"busybox"
+        verify(entries)
+
+    def test_embedded_nul_shell_target_rejected(self):
+        entries = boot_entries()
+        entries[2]["data"] = b"busybox\x00/surprise"
+        with self.assertRaisesRegex(ValueError, "BusyBox"):
+            verify(entries)
+
+    def test_multiple_nul_shell_target_rejected(self):
+        entries = boot_entries()
+        entries[2]["data"] = b"busybox\x00\x00"
+        with self.assertRaisesRegex(ValueError, "BusyBox"):
+            verify(entries)
 
     def test_wrong_console_node_rejected(self):
         entries = boot_entries()

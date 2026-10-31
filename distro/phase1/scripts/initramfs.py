@@ -75,7 +75,11 @@ def verify(path, release, revision):
     if not entries["/bin/busybox"]["data"].startswith(b"\x7fELF"):
         raise ValueError("BusyBox is not ELF")
     sh = entries["/bin/sh"]
-    if not stat.S_ISLNK(sh["mode"]) or sh["data"] not in (b"busybox", b"/bin/busybox"):
+    # Linux gen_init_cpio stores the symlink target INCLUDING its terminating
+    # NUL (strlen(target) + 1). Other newc writers may omit it. Accept both
+    # exact encodings, never embedded NULs or alternate/escaping targets.
+    sh_target = sh["data"].removesuffix(b"\x00")
+    if not stat.S_ISLNK(sh["mode"]) or sh_target not in (b"busybox", b"/bin/busybox"):
         raise ValueError("/bin/sh must resolve to the packaged BusyBox")
     for name, major, minor in (("/dev/console", 5, 1), ("/dev/null", 1, 3)):
         node = entries[name]
