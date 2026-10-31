@@ -1,0 +1,53 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Apply only the IPv4 lease supplied by the Phase 1 virtual DHCP service.
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+set -eu
+
+case "${interface-}" in
+    ''|*[!A-Za-z0-9_.:-]*) exit 1 ;;
+esac
+
+case "${1-}" in
+    deconfig)
+        rm -f /tmp/phase1-dhcp-lease
+        ip -4 addr flush dev "$interface"
+        ip link set "$interface" up
+        ;;
+    bound|renew)
+        case "${ip-}:${subnet-}" in
+            *[!0-9.:]*|:|:*) exit 1 ;;
+        esac
+        [ -n "${ip-}" ] && [ -n "${subnet-}" ] || exit 1
+        prefix_assignment=$(ipcalc -p "$ip" "$subnet")
+        case "$prefix_assignment" in
+            PREFIX=*) lease_prefix=${prefix_assignment#PREFIX=} ;;
+            *) exit 1 ;;
+        esac
+        case "$lease_prefix" in
+            ''|*[!0-9]*) exit 1 ;;
+        esac
+        [ "$lease_prefix" -le 32 ] || exit 1
+
+        # DHCP may provide several routers. Select the first without eval.
+        set -f
+        # Split the router list into words with globbing explicitly disabled.
+        # shellcheck disable=SC2086
+        set -- ${router-}
+        [ "$#" -gt 0 ] || exit 1
+        lease_router=$1
+        case "$lease_router" in
+            ''|*[!0-9.]*) exit 1 ;;
+        esac
+        ip -4 addr flush dev "$interface"
+        ip -4 addr add "$ip/$lease_prefix" dev "$interface"
+        ip link set "$interface" up
+        ip -4 route replace default via "$lease_router" dev "$interface"
+        # The guest validates both this record and the actual address/route.
+        printf '%s %s %s %s\n' "$interface" "$ip" "$lease_prefix" "$lease_router" \
+            > /tmp/phase1-dhcp-lease
+        ;;
+    *) exit 0 ;;
+esac

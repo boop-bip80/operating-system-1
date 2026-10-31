@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
+/.build/
 #
 # NOTE! Don't add files that are generated in specific
 # subdirectories here. Add them in the ".gitignore" file
@@ -11,6 +12,7 @@
 # Normal rules (sorted alphabetically)
 #
 .*
+!/.github/
 *.a
 *.asn1.[ch]
 *.bc

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Human-readable contract; the host validator additionally requires correct
+# identities, a zero QEMU exit, bounded runtime, and kernel power-down evidence.
+[round1]
+P1:INIT_OK
+P1:FS_OK
+P1:DISK_WRITE_OK
+P1:NET_OK
+P1:ROUND1_OK
+P1:POWER_OFF
+[round2]
+P1:INIT_OK
+P1:FS_OK
+P1:DISK_PERSIST_OK
+P1:NET_OK
+P1:PASS
+P1:POWER_OFF
+[interactive]
+P1:INIT_OK
+P1:SHELL_READY
+P1:INTERACTIVE_KERNEL:<expected-release>
+P1:INTERACTIVE_OK:<host-nonce>
+[negative]
+# Must show expected kernel's Linux version and a no-init/VFS kernel panic.
+# No P1: userspace marker may appear; a host launch failure is not a pass.

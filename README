@@ -1,1 +1,68 @@
+operating-system-1
+==================
 
+A Linux-based operating-system project working toward a cohesive,
+macOS-inspired desktop experience with original system applications and assets.
+This is not macOS, is not affiliated with Apple, and does not provide macOS
+binary compatibility.
+
+Current development stage: Phase 1 -- kernel-to-shell foundation.
+The implementation and CI harness are present; completion is evidence-gated.
+Do not assume that the phase has passed until the acceptance record in
+docs/os/PHASE_01.md links two clean CI runs/attempts for the same commit.
+There is no desktop, installer, live ISO, or bare-metal support claim yet.
+
+Quick start (Linux x86-64)
+-------------------------
+
+Install the host prerequisites listed in docs/os/PHASE_01.md, then run from
+the repository root:
+
+    make -C distro/phase1 check
+    make -C distro/phase1 build
+    make -C distro/phase1 test
+    make -C distro/phase1 run
+
+The build uses this repository's kernel and a pinned, statically linked
+BusyBox userspace. The automated tests boot in QEMU software emulation (TCG),
+so they do not require KVM, a privileged VM runner, or access to host disks.
+All build output and disposable virtual storage remain in .build/phase1/.
+
+The test suite covers two boots with ext4 persistence, DHCP networking, an
+actual interactive serial shell session, clean poweroff, and a deliberately
+broken initramfs. A successful QEMU exit alone is not considered a pass.
+
+Documentation
+-------------
+
+    docs/os/PHASE_01.md              Scope, commands, acceptance criteria
+    docs/os/BUILD_PROVENANCE.md      Source/dependency pins and evidence
+    docs/os/BOOT_TROUBLESHOOTING.md  Build and boot failure diagnosis
+
+GitHub Actions: https://github.com/boop-bip80/operating-system-1/actions
+Each Phase 1 run publishes its available build and test evidence as an
+artifact, including failed runs. Artifacts have a 14-day retention period;
+download evidence needed for a lasting release/review record.
+
+Kernel provenance and licensing
+-------------------------------
+
+This repository retains the Linux kernel source tree. The Phase 1 starting
+point is commit 1c542b368c25323551c74278e64a886ed0c6f129 on rcu-free-v3;
+its Makefile identifies Linux 7.3-rc7. New builds record the exact source
+commit actually built rather than treating this historical baseline as HEAD.
+The release-candidate kernel and virtual-machine test coverage are not a
+production stability or hardware-qualification guarantee.
+
+The distro scaffolding is isolated in distro/phase1/, and generated files
+are kept out of the kernel source directories. The root kernel Makefile is
+unchanged by the Phase 1 orchestration.
+
+See COPYING, LICENSES/, and Documentation/process/license-rules.rst for the
+Linux kernel's GPL-2.0 terms, syscall exception, and per-file licensing.
+BusyBox and the static C library retain their own license obligations;
+source versions, checksums, and redistribution notes are recorded in
+docs/os/BUILD_PROVENANCE.md. Preserve these notices when redistributing.
+
+Upstream kernel documentation: https://docs.kernel.org/
+Kernel build instructions: Documentation/admin-guide/README.rst

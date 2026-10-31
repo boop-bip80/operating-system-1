@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: GPL-2.0
+name: Phase 1 kernel boot
+
+on:
+  push:
+    branches: [rcu-free-v3]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase1-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-boot:
+    name: Build and boot x86-64 (QEMU TCG)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      JOBS: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record CI environment and source identity
+        run: |
+          set -euo pipefail
+          mkdir -p .build/phase1/logs
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          fields = (
+              "GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_REF",
+              "GITHUB_EVENT_NAME", "GITHUB_WORKFLOW", "GITHUB_RUN_ID",
+              "GITHUB_RUN_ATTEMPT", "RUNNER_OS", "RUNNER_ARCH",
+              "ImageOS", "ImageVersion",
+          )
+          evidence = {key: os.environ.get(key, "") for key in fields}
+          evidence["source_sha"] = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          pathlib.Path(".build/phase1/logs/ci-environment.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+
+      - name: Install build and VM dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev pkg-config \
+            musl-tools cpio gzip bzip2 xz-utils curl ca-certificates \
+            qemu-system-x86 e2fsprogs shellcheck file python3 git perl binutils
+          mkdir -p .build/phase1/logs
+          dpkg-query -W -f='${Package}\t${Version}\n' \
+            > .build/phase1/logs/host-packages.log
+
+      - name: Check scripts and test the host-side validator
+        run: make -C distro/phase1 check
+
+      - name: Build the repository kernel and static userspace
+        run: make -C distro/phase1 build
+
+      - name: Boot, persist data, exercise the shell, and reject a bad image
+        run: make -C distro/phase1 test
+
+      - name: Verify artifacts and provenance
+        run: make -C distro/phase1 verify
+
+      - name: Collect available diagnostics and build outputs
+        if: always()
+        run: make -C distro/phase1 artifact
+
+      - name: Upload evidence for this exact run and attempt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: phase1-${{ github.sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: .build/phase1/artifacts/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
