@@ -90,6 +90,9 @@ sfdisk --verify "$disk_image"
 sfdisk --json "$disk_image" > "$OUTPUT_DIR/partition-table.json"
 qemu-img convert -f raw -O qcow2 -c "$disk_image" "$OUTPUT_DIR/phase2.qcow2"
 qemu-img check -f qcow2 "$OUTPUT_DIR/phase2.qcow2"
+# The uploaded compressed image must expose exactly the bytes exercised by the
+# raw-base acceptance overlays, not merely be a structurally valid qcow2 file.
+qemu-img compare -f raw -F qcow2 "$disk_image" "$OUTPUT_DIR/phase2.qcow2"
 
 # Firmware inputs travel with the image/evidence and are hashed by the manifest.
 # Each boot copies the variable store; acceptance never mutates these originals.

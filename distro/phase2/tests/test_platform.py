@@ -206,6 +206,17 @@ class LockedInputsTests(unittest.TestCase):
         self.assertEqual(values["CONFIG_LOCALVERSION"], '"-phase2"')
 
 
+    def test_compressed_distributable_is_compared_with_tested_raw_image(self):
+        script = (PHASE / "scripts/build-image.sh").read_text()
+        conversion = script.index('qemu-img convert -f raw -O qcow2 -c "$disk_image"')
+        structural_check = script.index('qemu-img check -f qcow2 "$OUTPUT_DIR/phase2.qcow2"')
+        byte_comparison = script.index(
+            'qemu-img compare -f raw -F qcow2 "$disk_image" "$OUTPUT_DIR/phase2.qcow2"'
+        )
+        self.assertLess(conversion, structural_check)
+        self.assertLess(structural_check, byte_comparison)
+
+
 class ArtifactCollectionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="phase2-artifact-test-")

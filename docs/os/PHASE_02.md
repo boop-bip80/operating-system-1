@@ -3,10 +3,12 @@
 
 **Product direction:** a complete macOS-inspired Linux desktop experience.
 
-**Status:** implementation and integration in progress; acceptance pending.
-No source revision is declared Phase 2 DONE until every acceptance row below
-has fresh, linked evidence. A successful build, an uploaded image, or a desktop
-screenshot alone does not close this phase.
+**Status:** implemented; qualification is evaluated separately for each source
+commit using the CI runs and artifacts described below. A revision is Phase 2
+DONE only when all P2-01 through P2-16 requirements have evidence for that
+exact SHA. Without the required evidence, the revision is not yet qualified.
+This specification is not a blanket acceptance verdict: a successful build,
+an uploaded image, or a desktop screenshot alone does not close the phase.
 
 **Starting point:** `rcu-free-v3`,
 `16a28b193ffcbe213b876960b2cb910627feaee2`, following the Phase 1 foundation.
@@ -127,6 +129,44 @@ expose this auto-login development session on a public interface. Without
 `.build/phase2/run.qcow2`, does not enable the automated guest test, and does
 not modify the base image. Shut down the guest cleanly before restarting or
 copying its writable overlay.
+
+### Run a downloaded artifact
+
+The curated CI bundle contains a standalone `phase2.qcow2`, `ovmf-code.fd`
+and `ovmf-vars.fd`, **not** the raw `phase2.img` expected by the checkout
+launcher. Extract the matching artifact into a fresh directory on an x86-64
+Linux host with `qemu-system-x86` and `qemu-utils` installed, then run these
+commands from that directory:
+
+```sh
+(
+  set -eu
+  sha256sum -c SHA256SUMS
+  # Refuse an existing run directory; never overwrite a previous guest disk.
+  mkdir -m 700 -- desktop-run
+  qemu-img create -f qcow2 -F qcow2 \
+    -b "$(realpath -- phase2.qcow2)" desktop-run/disk.qcow2
+  cp -- ovmf-vars.fd desktop-run/vars.fd
+  qemu-system-x86_64 \
+    -machine q35,accel=tcg -cpu qemu64 -m 2048 -smp 2 \
+    -drive if=pflash,format=raw,readonly=on,file=ovmf-code.fd \
+    -drive if=pflash,format=raw,file=desktop-run/vars.fd \
+    -drive if=none,id=root,format=qcow2,file=desktop-run/disk.qcow2 \
+    -device virtio-blk-pci,drive=root \
+    -vga none -device virtio-gpu-pci,xres=1024,yres=768 \
+    -device virtio-keyboard-pci -device virtio-tablet-pci \
+    -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+    -display none -vnc 127.0.0.1:1 \
+    -monitor stdio -serial file:desktop-run/serial.log -no-reboot
+)
+```
+
+Connect VNC to `127.0.0.1:5901`. This is a normal desktop boot: no test-mode
+firmware flag is supplied. The base disk and supplied firmware remain unchanged;
+user changes live in `desktop-run/disk.qcow2`. Type `system_powerdown` at the
+QEMU monitor prompt to request a clean ACPI shutdown, and wait for QEMU to exit.
+To resume that guest later, rerun only the QEMU command from the same directory.
+Keep the base image at its original absolute path while its overlay is in use.
 
 ## Implementation work packages
 
@@ -277,33 +317,61 @@ attempts; do not describe two jobs inside a single run as two independent
 runs. A later source change needs its own validation. Cancelling obsolete
 push runs does not erase completed acceptance evidence.
 
-## Mandatory acceptance record
+## Mandatory acceptance requirements
 
-All verdicts remain pending until linked evidence names the tested commit.
+Evaluate these requirements for the exact commit being reviewed. Evidence paths
+below are relative to that attempt's curated artifact unless stated otherwise;
+the table defines checks, not a permanent pending or passed verdict.
 
-| ID | Mandatory assertion | Required evidence | Verdict |
-| --- | --- | --- | --- |
-| P2-01 | Exact source and dependency identity is recorded | Source SHA/dirty state, manifest, package/source and host inventories | Pending |
-| P2-02 | Correct own kernel and effective graphical/systemd config | Build log, release, config validation and checksum | Pending |
-| P2-03 | Signed pinned Debian bootstrap completes without trust bypass | Snapshot/keyring inputs, signature/package logs, APT configuration | Pending |
-| P2-04 | APT/dpkg installs and removes a package coherently | Offline proof-package install/payload/purge, inventory, empty `dpkg --audit` result | Pending |
-| P2-05 | Standalone GPT/ESP image boots through OVMF and GRUB | Partition/bootloader evidence and QEMU command without direct kernel boot | Pending |
-| P2-06 | Expected kernel/source, systemd PID 1 and QEMU network operate | Runtime identity, DHCP/default route and gateway-reachability assertions | Pending |
-| P2-07 | Desktop runs unprivileged through a local logind session | UID 1000, session/runtime-directory and compositor evidence | Pending |
-| P2-08 | Real DRM/KMS output uses Pixman, not a headless/nested backend | Weston log, rendered probe and framebuffer capture | Pending |
-| P2-09 | Real keyboard and pointer events reach a Wayland client | Host nonce, guest receipt/acknowledgment and QMP transcript | Pending |
-| P2-10 | User data survives a separate second boot | Matching input-derived nonce read from reused overlay | Pending |
-| P2-11 | Normal reference desktop and terminal are visible | Actual post-probe framebuffer screenshots | Pending |
-| P2-12 | Both positive boots and expected negative outcome are bounded | Scenario verdicts, timings, shutdown/failure evidence and complete logs | Pending |
-| P2-13 | Missing GPU is correctly rejected without a false-positive fallback | Guest-stage negative evidence, no desktop pass, no host-launch substitution | Pending |
-| P2-14 | Bootable artifact and evidence are verifiable | Checksums, manifest-bound results, compressed disk/firmware bundle | Pending |
-| P2-15 | Independent reproduction and Phase 1 regression pass | Two same-SHA Phase 2 attempt URLs/artifacts and same-SHA Phase 1 result | Pending |
-| P2-16 | Documentation, license provenance and scope are accurate | Reviewed instructions/notices and no unsupported release claims | Pending |
+| ID | Mandatory assertion | Verification evidence and location |
+| --- | --- | --- |
+| P2-01 | Exact source and dependency identity is recorded | `manifest.json`, `source-revision`, `rootfs-packages.tsv`, `logs/host-packages.log` and `logs/ci-environment.json` agree on the clean source and inputs |
+| P2-02 | Correct own kernel and effective graphical/systemd config | `logs/build-kernel.log`, `logs/kernel-config-validation.log`, `kernelrelease`, `kernel.config` and kernel checksum |
+| P2-03 | Signed pinned Debian bootstrap completes without trust bypass | `inputs.lock`, `logs/build-rootfs.log`, `apt-release-metadata/` and `rootfs-sources.list` |
+| P2-04 | APT/dpkg installs and removes a package coherently | Positive boot logs: offline proof-package install/payload/purge, empty `dpkg --audit`, and `P2:PACKAGE_OK`; package inventory |
+| P2-05 | Standalone GPT/ESP image boots through OVMF and GRUB | `partition-table.json`, `grub.cfg`, image-build log, and source-bound QEMU command without direct kernel boot |
+| P2-06 | Expected kernel/source, systemd PID 1 and QEMU network operate | Positive boot logs: runtime identity, DHCP/default route and gateway-reachability assertions |
+| P2-07 | Desktop runs unprivileged through a local logind session | Positive boot logs: UID 1000, session/runtime-directory assertions and compositor diagnostics |
+| P2-08 | Real DRM/KMS output uses Pixman, not a headless/nested backend | Fresh Weston diagnostics in boot logs, native rendered probe, and framebuffer captures in `screenshots/` |
+| P2-09 | Real keyboard and pointer events reach a Wayland client | `test-results.json` nonce, matching guest acknowledgments in boot logs, and `logs/qmp-{round1,round2}.jsonl` |
+| P2-10 | User data survives a separate second boot | Round 1 input-derived nonce matches round 2's persisted value in results and boot logs |
+| P2-11 | Normal reference desktop and terminal are visible | `P2:TERMINAL_READY` from the PTY/shell checks and actual post-probe `screenshots/{round1,round2}-desktop.*` |
+| P2-12 | Both positive boots and expected negative outcome are bounded | `test-results.json` scenario verdicts/timings and complete boot logs with shutdown/failure evidence |
+| P2-13 | Missing GPU is correctly rejected without a false-positive fallback | `logs/boot-negative.log`: guest-stage `P2:FAIL:NO_DRM`, no desktop pass, and no host-launch substitution |
+| P2-14 | Bootable artifact and evidence are verifiable | `SHA256SUMS`, manifest-bound results, `diagnostics/acceptance-verification.log`, `phase2.qcow2` and OVMF copies |
+| P2-15 | Independent reproduction and Phase 1 regression pass | Two successful same-SHA Phase 2 full run/attempt URLs and artifacts, plus a successful same-SHA Phase 1 result and artifact |
+| P2-16 | Documentation, license provenance and scope are accurate | Review the exact revision's instructions/notices, `SOURCE.txt`, `licenses/` and package/source inventory; no unsupported release claims |
 
-**DONE requires P2-01 through P2-16 to be verified for the same tested source
-revision.** Until then, report what was implemented and what was actually run,
-and leave the acceptance state pending. Add real run/attempt and artifact URLs
-here after qualification; never pre-fill success from planned tests.
+### Determine the qualification of a commit
+
+1. Select the full source SHA, not merely the branch name or latest workflow
+   badge. Find **two successful clean full runs or full attempts** for that SHA
+   on the [Phase 2 workflow page](https://github.com/boop-bip80/operating-system-1/actions/workflows/phase2-desktop.yml).
+   Both must complete the build, all three QEMU scenarios, verification and
+   artifact upload. An in-progress run or a successful host-check step is not
+   acceptance evidence.
+2. Download each matching `phase2-{sha}-{run_id}-attempt-{attempt}` artifact.
+   Check its `SHA256SUMS`; confirm the manifest and CI metadata identify the
+   chosen clean SHA and the respective run/attempt. The canonical
+   `test-results.json` must say `pass`, contain passing `round1`, `round2` and
+   `negative` cases, and bind to the actual manifest hash. Review the verifier
+   log and the evidence in P2-01 through P2-16. A diagnostic-only report or a
+   `not_validated` verdict cannot qualify a commit, even if upload succeeded.
+3. Confirm a successful complete run on the
+   [Phase 1 workflow page](https://github.com/boop-bip80/operating-system-1/actions/workflows/phase1-boot.yml)
+   for the **same SHA**, including its four boot cases and verified artifact.
+   The historical Phase 1 reference verdict does not replace this regression.
+4. Compare both Phase 2 manifests and record the exact SHA, run/attempt URLs,
+   artifact identities/checksums and review outcome in the release, PR or
+   reviewer evidence record. Keep the required evidence beyond the 14-day
+   artifact retention window when a lasting qualification record is needed.
+
+**DONE requires all P2-01 through P2-16 for that same source revision.** The
+matching CI/artifact evidence establishes the verdict; no source edit is
+needed to change this specification from pending to passed. A newer commit,
+including a documentation-only commit, requires its own qualification. Missing
+or incomplete evidence must be reported as unqualified, never inferred from
+an earlier revision's success.
 
 ## Failure contract and next milestone
 

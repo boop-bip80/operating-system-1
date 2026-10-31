@@ -7,7 +7,15 @@ This is not macOS, is not affiliated with Apple, and does not provide macOS
 binary compatibility.
 
 Current development stage: Phase 2 -- bootable distribution and graphical
-baseline IMPLEMENTED; full CI acceptance is pending (docs/os/PHASE_02.md).
+baseline IMPLEMENTED. Qualification is per source commit: acceptance requires
+two clean Phase 2 workflow attempts and a passing Phase 1 regression on the
+same SHA, with all evidence specified in docs/os/PHASE_02.md. The matching CI
+runs and artifacts, not this status line, establish whether a revision passed.
+
+Phase 2 qualification workflow:
+https://github.com/boop-bip80/operating-system-1/actions/workflows/phase2-desktop.yml
+Same-commit Phase 1 regression workflow:
+https://github.com/boop-bip80/operating-system-1/actions/workflows/phase1-boot.yml
 
 Phase 1 -- kernel-to-shell foundation VERIFIED
 on reference commit 4cc3727310198a1df85f47a818873477bcd31f5b.
