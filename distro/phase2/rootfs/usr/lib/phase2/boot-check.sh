@@ -68,7 +68,7 @@ reason=DRM_CHECK
 # shellcheck source=../rootfs/usr/lib/phase2/drm-check.sh
 source /usr/lib/phase2/drm-check.sh
 reason=NO_DRM
-phase2_find_virtio_drm
+phase2_find_virtio_drm /sys/class/drm /dev/dri
 emit DRM_OK
 reason=INPUT_DEVICES
 keyboard_found=false

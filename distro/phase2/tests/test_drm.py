@@ -19,7 +19,7 @@ class VirtioDRMTests(unittest.TestCase):
             "# shellcheck source=../rootfs/usr/lib/phase2/drm-check.sh\n"
             "source /usr/lib/phase2/drm-check.sh\n"
             "reason=NO_DRM\n"
-            "phase2_find_virtio_drm\n"
+            "phase2_find_virtio_drm /sys/class/drm /dev/dri\n"
             "emit DRM_OK\n",
             boot_check,
         )
