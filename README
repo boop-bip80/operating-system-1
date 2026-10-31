@@ -6,11 +6,13 @@ macOS-inspired desktop experience with original system applications and assets.
 This is not macOS, is not affiliated with Apple, and does not provide macOS
 binary compatibility.
 
-Current development stage: Phase 1 -- kernel-to-shell foundation.
-The implementation and CI harness are present; completion is evidence-gated.
-Do not assume that the phase has passed until the acceptance record in
-docs/os/PHASE_01.md links two clean CI runs/attempts for the same commit.
-There is no desktop, installer, live ISO, or bare-metal support claim yet.
+Current development stage: Phase 1 -- kernel-to-shell foundation VERIFIED
+on reference commit 4cc3727310198a1df85f47a818873477bcd31f5b.
+Two clean GitHub Actions attempts passed the full kernel/BusyBox build and four
+QEMU boot scenarios; the acceptance record and downloadable evidence are in
+docs/os/PHASE_01.md. Each newer commit must pass its own CI validation.
+Phase 2 has not begun. There is no desktop, installer, live ISO, or bare-metal
+support claim yet.
 
 Quick start (Linux x86-64)
 -------------------------

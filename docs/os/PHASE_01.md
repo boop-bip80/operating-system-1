@@ -3,7 +3,11 @@
 
 **Product direction:** a complete macOS-inspired Linux desktop experience.
 
-**Status:** implementation added; execution evidence pending. **Not DONE.**
+**Status:** **DONE for reference commit `4cc3727310198a1df85f47a818873477bcd31f5b`**:
+two fresh GitHub Actions attempts passed all 14 acceptance criteria on that
+revision. This is an x86-64/QEMU-only qualification, not a desktop release.
+Any later source revision requires its own clean validation before being
+accepted; see the linked evidence below.
 
 **Source baseline:** `rcu-free-v3`, `1c542b368c25323551c74278e64a886ed0c6f129`, Linux 7.3-rc7.
 
@@ -49,7 +53,7 @@ On Ubuntu 24.04 x86-64, install the build and test prerequisites:
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   build-essential bc bison flex libssl-dev libelf-dev pkg-config \
-  musl-tools cpio gzip bzip2 xz-utils curl ca-certificates \
+  musl-tools rsync cpio gzip bzip2 xz-utils curl ca-certificates \
   qemu-system-x86 e2fsprogs shellcheck file python3 git perl binutils
 ```
 
@@ -171,37 +175,47 @@ manifests. A source change requires new validation for that source revision.
 
 ## Mandatory acceptance record
 
-Every row starts unverified. Change its verdict only when the associated real
-logs, build artifacts, or reviewed source support the assertion.
+The verdicts below are scoped to the independently tested reference commit
+`4cc3727310198a1df85f47a818873477bcd31f5b`. Each is backed by the
+linked CI runs, their per-attempt artifacts, or reviewed repository contents.
+Do not transfer these verdicts to a later commit without fresh evidence.
 
 | ID | Mandatory assertion | Required evidence | Verdict |
 | --- | --- | --- | --- |
-| AC-01 | Correct repository commit and baseline recorded | Actual source SHA and manifest | Pending |
-| AC-02 | `bzImage` built from this kernel | Build log, config, checksum | Pending |
-| AC-03 | Boot-critical options effective as built-ins | Configuration validation output | Pending |
-| AC-04 | Executable `/init`, static BusyBox, valid archive | ELF and archive validation | Pending |
-| AC-05 | PID 1 reached without panic within 180 seconds | Round 1 serial log and timing | Pending |
-| AC-06 | Real interactive shell accepts and executes commands | Non-test serial session | Pending |
-| AC-07 | procfs/sysfs/devtmpfs/tmpfs and temporary writes work | Guest assertions and `P1:FS_OK` | Pending |
-| AC-08 | Virtio ext4 data survives a second boot | Unique-nonce write/read logs | Pending |
-| AC-09 | Virtio-net receives and applies DHCP IPv4 configuration | Guest network evidence | Pending |
-| AC-10 | Both persistence boots power off cleanly on time | Exit status, shutdown evidence, timing | Pending |
-| AC-11 | Broken initramfs is rejected for a guest boot failure | Negative-control log | Pending |
-| AC-12 | Two clean CI runs/attempts pass on the same commit | Two workflow attempt URLs and artifacts | Pending |
-| AC-13 | README and license provenance are correct | Reviewed `README`, `COPYING`, provenance | Pending |
-| AC-14 | Documented commands reproduce the tested result | Reviewer reproduction or CI evidence | Pending |
+| AC-01 | Correct repository commit and baseline recorded | Actual source SHA and manifest | Verified |
+| AC-02 | `bzImage` built from this kernel | Build log, config, checksum | Verified |
+| AC-03 | Boot-critical options effective as built-ins | Configuration validation output | Verified |
+| AC-04 | Executable `/init`, static BusyBox, valid archive | ELF and archive validation | Verified |
+| AC-05 | PID 1 reached without panic within 180 seconds | Round 1 serial log and timing | Verified |
+| AC-06 | Real interactive shell accepts and executes commands | Non-test serial session | Verified |
+| AC-07 | procfs/sysfs/devtmpfs/tmpfs and temporary writes work | Guest assertions and `P1:FS_OK` | Verified |
+| AC-08 | Virtio ext4 data survives a second boot | Unique-nonce write/read logs | Verified |
+| AC-09 | Virtio-net receives and applies DHCP IPv4 configuration | Guest network evidence | Verified |
+| AC-10 | Both persistence boots power off cleanly on time | Exit status, shutdown evidence, timing | Verified |
+| AC-11 | Broken initramfs is rejected for a guest boot failure | Negative-control log | Verified |
+| AC-12 | Two clean CI runs/attempts pass on the same commit | Two workflow attempt URLs and artifacts | Verified |
+| AC-13 | README and license provenance are correct | Reviewed `README`, `COPYING`, provenance | Verified |
+| AC-14 | Documented commands reproduce the tested result | Reviewer reproduction or CI evidence | Verified |
 
 **DONE requires AC-01 through AC-14 to be verified.** An implementation, a PR,
 syntax-only checks, an untested artifact, or a screenshot does not close the
 phase. Keep implementation status separate from acceptance status.
 
-### CI evidence to fill after execution
+### Accepted CI evidence (2026-10-31)
 
-- Tested commit: pending.
-- First successful run/attempt URL: pending.
-- Second successful run/attempt URL: pending.
-- Artifact names and SHA-256 manifest: pending.
-- Reviewer verdict and remaining blockers: pending execution evidence.
+- Tested commit: [`4cc3727310198a1df85f47a818873477bcd31f5b`](https://github.com/boop-bip80/operating-system-1/commit/4cc3727310198a1df85f47a818873477bcd31f5b).
+- First independent success: [workflow attempt 1](https://github.com/boop-bip80/operating-system-1/actions/runs/41235925218/attempts/1), [artifact 13056445678](https://github.com/boop-bip80/operating-system-1/actions/runs/41235925218/artifacts/13056445678).
+- Second independent success: [workflow attempt 2](https://github.com/boop-bip80/operating-system-1/actions/runs/41235925218/attempts/2), [artifact 13056193831](https://github.com/boop-bip80/operating-system-1/actions/runs/41235925218/artifacts/13056193831).
+- Both artifact names include source SHA `4cc3727310198a1df85f47a818873477bcd31f5b`,
+  run ID `41235925218`, and their respective attempt numbers. Each bundle
+  contains `SHA256SUMS`, `manifest.json`, kernel/BusyBox configuration and
+  build logs, serial logs, and `test-results.json` bound to its manifest hash.
+- Both executions built Linux `7.3.0-rc7-phase1+`, validated static BusyBox and
+  65 initramfs entries, passed the 89 host tests and all four QEMU cases
+  (`round1`, `round2`, `interactive`, `negative`), and passed manifest verification.
+- Reviewer verdict: **AC-01–AC-14 verified for the tested commit**. No known
+  Phase 1 acceptance blockers remain for the QEMU reference target. A new
+  commit—even a documentation-only follow-up—must pass its own CI gate.
 
 ## Failure contract and deferred work
 
