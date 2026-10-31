@@ -202,8 +202,82 @@ class OutputSafetyTests(unittest.TestCase):
         self.assertNotEqual(self.copy_keyring(extraction).returncode, 0)
         self.assertEqual(sentinel.read_bytes(), b"do not change")
 
+    def sources_fixture(self):
+        self.prepare()
+        sources = self.out / "rootfs/etc/apt/sources.list.d"
+        sources.mkdir(parents=True)
+        return sources
+
+    def clean_bootstrap_sources(self):
+        script = (PHASE / "scripts/build-rootfs.sh").read_text()
+        start = script.index('bootstrap_sources=')
+        end = script.index('\n\n', start)
+        return self.run_guard(script[start:end])
+
+    def test_removes_only_known_bootstrap_duplicate_after_canonical_sources(self):
+        sources = self.sources_fixture()
+        duplicate = sources / "0000rootfs-sources.list"
+        duplicate.write_text("bootstrap duplicate")
+        other = sources / "other.list"
+        other.write_text("unrelated source")
+        canonical = sources.parent / "sources.list"
+        canonical.write_text("canonical signed snapshot")
+        result = self.clean_bootstrap_sources()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(duplicate.exists())
+        self.assertEqual(other.read_text(), "unrelated source")
+        self.assertEqual(canonical.read_text(), "canonical signed snapshot")
+        script = (PHASE / "scripts/build-rootfs.sh").read_text()
+        self.assertLess(script.index('> "$ROOTFS_DIR/etc/apt/sources.list"'),
+                        script.index('bootstrap_sources='))
+
+    def test_missing_bootstrap_duplicate_needs_no_cleanup(self):
+        self.sources_fixture()
+        result = self.clean_bootstrap_sources()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_bootstrap_source_symlink_is_not_removed_or_followed(self):
+        sources = self.sources_fixture()
+        sentinel = Path(self.temporary.name) / "sentinel"
+        sentinel.write_text("do not change")
+        duplicate = sources / "0000rootfs-sources.list"
+        duplicate.symlink_to(sentinel)
+        self.assertNotEqual(self.clean_bootstrap_sources().returncode, 0)
+        self.assertTrue(duplicate.is_symlink())
+        self.assertEqual(sentinel.read_text(), "do not change")
+
+    def test_bootstrap_source_symlink_parent_cannot_delete_external_file(self):
+        self.prepare()
+        apt_dir = self.out / "rootfs/etc/apt"
+        apt_dir.mkdir(parents=True)
+        external = Path(self.temporary.name) / "external"
+        external.mkdir()
+        sentinel = external / "0000rootfs-sources.list"
+        sentinel.write_text("do not change")
+        (apt_dir / "sources.list.d").symlink_to(external, target_is_directory=True)
+        self.assertNotEqual(self.clean_bootstrap_sources().returncode, 0)
+        self.assertEqual(sentinel.read_text(), "do not change")
+
 
 class LockedInputsTests(unittest.TestCase):
+    def test_local_package_install_disables_repositories_without_no_download(self):
+        script = (PHASE / "rootfs/usr/lib/phase2/boot-check.sh").read_text()
+        start = script.index("export DEBIAN_FRONTEND=noninteractive")
+        end = script.index('[[ "$(dpkg-query', start)
+        # Capture actual command arguments and environment without invoking APT.
+        command = 'apt-get() { printf "%s\\0" "$DEBIAN_FRONTEND" "$@"; };\n' + script[start:end]
+        result = subprocess.run(["bash", "-c", command], capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.decode().split("\0")[:-1], [
+            "noninteractive", "--assume-yes", "--no-install-recommends",
+            "-o", "Dir::Etc::sourcelist=/dev/null", "-o", "Dir::Etc::sourceparts=-",
+            "install", "/opt/phase2/packages/phase2-proof_1.0_all.deb",
+        ])
+        control = (PHASE / "rootfs/opt/phase2/package-source/DEBIAN/control").read_text()
+        self.assertNotRegex(control, r"(?im)^(Pre-Depends|Depends|Recommends):")
+        self.assertIn("apt-get --assume-yes --no-download purge phase2-proof", script)
+        self.assertIn('[[ -z "$(dpkg --audit)" ]]', script)
+
     def test_partition_and_filesystem_ids_are_unique_uuids(self):
         values = lock_values()
         identifiers = [values[key] for key in (

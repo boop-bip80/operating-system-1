@@ -70,6 +70,16 @@ mmdebstrap --mode=root --variant=minbase --format=directory \
 sed 's/\[check-valid-until=no\]/[check-valid-until=no signed-by=\/usr\/share\/keyrings\/debian-archive-keyring.gpg]/' \
     "$OUTPUT_DIR/rootfs-sources.list" > "$ROOTFS_DIR/etc/apt/sources.list"
 install -m 644 "$ROOTFS_DIR/etc/apt/sources.list" "$OUTPUT_DIR/rootfs-sources.list"
+# mmdebstrap preserves the input list under this generated filename. The
+# canonical signed list above replaces it; do not delete any other source file.
+bootstrap_sources="$ROOTFS_DIR/etc/apt/sources.list.d/0000rootfs-sources.list"
+if [[ -e "$bootstrap_sources" || -L "$bootstrap_sources" ]]; then
+    phase2_assert_regular "$bootstrap_sources"
+    [[ "$(realpath -e -- "$bootstrap_sources")" == "$bootstrap_sources" ]] || \
+        phase2_die 'bootstrap sources path is redirected outside fresh rootfs staging'
+    rm -- "$bootstrap_sources"
+fi
+
 bash "$PHASE_DIR/scripts/configure-rootfs.sh" "$ROOTFS_DIR"
 # dpkg-query expands these field names, not the host shell.
 # shellcheck disable=SC2016

@@ -40,7 +40,11 @@ if [[ -f "$test_flag" && "$(tr -d '\0' < "$test_flag")" == 1 ]]; then
 fi
 reason=PACKAGE_MANAGER
 export DEBIAN_FRONTEND=noninteractive
-apt-get --assume-yes --no-download install /opt/phase2/packages/phase2-proof_1.0_all.deb
+# APT 3's --no-download path mishandles a local .deb's internal filename. Keep
+# this dependency-free proof offline by disabling repositories for this command.
+apt-get --assume-yes --no-install-recommends \
+    -o Dir::Etc::sourcelist=/dev/null -o Dir::Etc::sourceparts=- \
+    install /opt/phase2/packages/phase2-proof_1.0_all.deb
 [[ "$(dpkg-query -W -f='${Status}' phase2-proof)" == 'install ok installed' ]]
 [[ -f /usr/share/phase2-proof/marker ]]
 apt-get --assume-yes --no-download purge phase2-proof

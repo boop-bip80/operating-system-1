@@ -639,6 +639,46 @@ class TestArtifactSafety(unittest.TestCase):
                                        "-b", str(root / "phase2.img"), str(root / "test.qcow2")])
 
 
+class TestFailureDiagnostics(unittest.TestCase):
+    def test_only_last_eighty_lines_including_partial_final_line(self):
+        output = "\n".join(f"line {index:03d}" for index in range(100))
+        tail = smoke.serial_diagnostic_tail(output)
+        self.assertEqual(len(tail.splitlines()), 80)
+        self.assertTrue(tail.startswith("phase2: guest | line 020\n"))
+        self.assertTrue(tail.endswith("phase2: guest | line 099"))
+        self.assertNotIn("line 019", tail)
+
+    def test_byte_budget_and_valid_unicode_when_line_is_huge(self):
+        output = "old evidence\n" + "\u20ac" * 20000 + "\nP2:FAIL:PACKAGE_MANAGER\n"
+        tail = smoke.serial_diagnostic_tail(output)
+        self.assertLessEqual(len((tail + "\n").encode("utf-8")), smoke.DIAGNOSTIC_TAIL_BYTES)
+        self.assertIn("[earlier bytes truncated]", tail)
+        self.assertTrue(tail.endswith("phase2: guest | P2:FAIL:PACKAGE_MANAGER"))
+        self.assertNotIn("old evidence", tail)
+
+    def test_terminal_controls_and_workflow_commands_are_diagnostic_only(self):
+        tail = smoke.serial_diagnostic_tail("\x1b[31mAPT error\r\n::error::not a host verdict\n")
+        self.assertNotIn("\x1b", tail)
+        self.assertIn("\\x1b[31mAPT error", tail)
+        self.assertIn("phase2: guest | ::error::not a host verdict", tail)
+        self.assertTrue(all(line.startswith("phase2: guest | ") for line in tail.splitlines()))
+
+    def test_empty_guest_output_is_explicit(self):
+        self.assertIn("(no serial output captured)", smoke.serial_diagnostic_tail(""))
+
+    def test_printing_diagnostics_does_not_change_serial_evidence_or_result(self):
+        result = smoke.BootResult(name="round1", output="P2:FAIL:PACKAGE_MANAGER\r\n", returncode=1)
+        before = vars(result).copy()
+        with patch.object(smoke.sys, "stderr", new_callable=io.StringIO) as stderr:
+            smoke.print_failure_diagnostics(result, "logs/boot-round1.log")
+        diagnostic = stderr.getvalue()
+        self.assertIn("diagnostic serial tail for round1", diagnostic)
+        self.assertIn("full evidence unchanged: logs/boot-round1.log", diagnostic)
+        self.assertIn("phase2: guest | P2:FAIL:PACKAGE_MANAGER", diagnostic)
+        self.assertIn("end diagnostic serial tail", diagnostic)
+        self.assertEqual(vars(result), before)
+
+
 class TestLauncher(unittest.TestCase):
     """Exercise the real shell command construction with non-VM tool stand-ins."""
 

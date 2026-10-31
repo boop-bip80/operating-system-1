@@ -34,6 +34,8 @@ import zlib
 
 
 MAX_LOG_BYTES = 32 * 1024 * 1024
+DIAGNOSTIC_TAIL_LINES = 80
+DIAGNOSTIC_TAIL_BYTES = 16 * 1024
 MAX_QMP_LINE = 1024 * 1024
 MAX_SCREEN_BYTES = 4096 * 4096 * 3 + 4096
 SOURCE_RE = re.compile(r"[0-9a-f]{40}(?:-dirty)?\Z")
@@ -801,6 +803,32 @@ def write_report(path: Path, report: dict) -> None:
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def serial_diagnostic_tail(output: str) -> str:
+    """Return bounded, prefixed diagnostics without modifying acceptance evidence."""
+    lines = output.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    prefix = "phase2: guest | "
+    # Escape terminal controls and prefix every line so guest output cannot be
+    # mistaken for a host verdict or a CI workflow command.
+    lines = ["".join(character if character.isprintable() or character == "\t"
+                     else f"\\x{ord(character):02x}" for character in line)
+             for line in lines[-DIAGNOSTIC_TAIL_LINES:]]
+    text = "\n".join(prefix + line for line in lines) if lines else prefix + "(no serial output captured)"
+    encoded = text.encode("utf-8")
+    budget = DIAGNOSTIC_TAIL_BYTES - 1  # Include print's terminating newline.
+    if len(encoded) > budget:
+        truncated = prefix + "[earlier bytes truncated] "
+        text = truncated + encoded[-(budget - len(truncated.encode("utf-8"))):].decode("utf-8", errors="ignore")
+    return text
+
+
+def print_failure_diagnostics(result: BootResult, serial_log: str) -> None:
+    print(f"phase2: diagnostic serial tail for {result.name} "
+          f"(last {DIAGNOSTIC_TAIL_LINES} lines, at most {DIAGNOSTIC_TAIL_BYTES} bytes; "
+          f"full evidence unchanged: {serial_log})", file=sys.stderr)
+    print(serial_diagnostic_tail(result.output), file=sys.stderr)
+    print("phase2: end diagnostic serial tail", file=sys.stderr, flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=300, help="deadline per VM boot (seconds)")
@@ -841,6 +869,7 @@ def main() -> int:
             report["cases"].append(record)
             write_report(report_path, report)
             if record["status"] != "pass":
+                print_failure_diagnostics(result, record["serial_log"])
                 raise SmokeFailure(f"{name}: {record.get('error', 'unknown failure')}; see {record['serial_log']}")
             if name == "round1":
                 previous_nonce = result.nonce
