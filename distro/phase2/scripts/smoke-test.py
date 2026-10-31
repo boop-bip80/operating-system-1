@@ -41,8 +41,16 @@ MAX_SCREEN_BYTES = 4096 * 4096 * 3 + 4096
 SOURCE_RE = re.compile(r"[0-9a-f]{40}(?:-dirty)?\Z")
 NONCE_RE = re.compile(r"[0-9a-f]{32}\Z")
 KERNEL_FAILURE_RE = re.compile(
-    r"Kernel panic|\bOops:|\bBUG:|No working init found|"
-    r"EXT4-fs error|EXT4-fs.*(?:corrupt|abort)", re.IGNORECASE,
+    # Serial contains both printk and desktop logs. Match kernel message
+    # families at a line boundary, or after printk's numeric uptime prefix even
+    # when a userspace write left a partial line. A desktop HH:MM:SS timestamp
+    # and libinput's "client bug:" warnings are not kernel BUG reports.
+    # No trailing newline is required: the live monitor scans partial writes.
+    r"(?:(?:^|[\r\n])[ \t]*(?:<\d+>[ \t]*)?|"
+    r"(?:<\d+>[ \t]*)?\[[ \t]*\d+(?:\.\d+)?\][ \t]*)"
+    r"(?:Kernel panic\b|Oops:|BUG:|kernel BUG at\b|"
+    r"(?:NMI )?watchdog:[ \t]+BUG:|No working init found\b|"
+    r"EXT4-fs[^\r\n]*(?:\berror\b|corrupt|abort))", re.IGNORECASE,
 )
 POWER_DOWN_RE = re.compile(r"^(?:\[[\d .]+\]\s*)?reboot:\s*Power down\.?\s*$")
 BOOT_MARKERS = (

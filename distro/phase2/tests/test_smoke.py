@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -301,6 +302,104 @@ class TestNegativeEvidence(unittest.TestCase):
                 result.output = result.output.replace(marker + "\n", "")
                 with self.assertRaises(smoke.SmokeFailure):
                     smoke.validate_negative_boot(result, RELEASE, SOURCE)
+
+
+class TestKernelFailureClassification(unittest.TestCase):
+    WARNINGS = (
+        "[22:58:58.061] client bug: timer event2 debounce: scheduled expiry is in the past (-24ms), your system is too slow",
+        "[22:58:58.075] client bug: timer event2 debounce short: scheduled expiry is in the past (-52ms), your system is too slow",
+    )
+    KERNEL_MESSAGES = (
+        "BUG: unable to handle page fault for address: 0000000000000000",
+        "kernel BUG at mm/slub.c:123!",
+        "watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [weston:123]",
+        "NMI watchdog: BUG: hard LOCKUP on cpu 1",
+        "Kernel panic - not syncing: Fatal exception",
+        "Oops: general protection fault, probably for non-canonical address",
+        "No working init found. Try passing init= option to kernel.",
+        "EXT4-fs error (device vda2): ext4_find_entry: inode corrupted",
+        "EXT4-fs (vda2): Remounting filesystem read-only after abort",
+        "EXT4-fs (vda2): I/O error while writing superblock",
+    )
+
+    def monitor(self, output):
+        # Exercise the real live classifier without starting a VM/thread.
+        monitor = smoke.SerialMonitor.__new__(smoke.SerialMonitor)
+        monitor.process = Mock()
+        monitor.process.poll.return_value = None
+        monitor.deadline = time.monotonic() + 30
+        monitor.expected_failure = None
+        monitor.data = bytearray(output.encode())
+        monitor.lock = threading.Lock()
+        monitor.output_limit = False
+        monitor.timed_out = False
+        monitor.read_error = None
+        return monitor
+
+    def test_actual_libinput_warnings_are_not_kernel_failures(self):
+        output = "\n".join(self.WARNINGS) + "\n"
+        self.assertIsNone(smoke.KERNEL_FAILURE_RE.search(output))
+        self.monitor(output).check()
+        result = good_result(OLD_NONCE)
+        result.output = result.output.replace("P2:PROBE_CLOSED", output + "P2:PROBE_CLOSED")
+        smoke.validate_test_boot(result, RELEASE, SOURCE)
+
+    def test_userspace_client_bug_is_not_classified_by_case_or_substring(self):
+        for line in ("client bug: a slow timer", "client BUG: a slow timer",
+                     "[   30.100000] client bug: a slow timer",
+                     "[22:58:58.061] client BUG: a slow timer"):
+            with self.subTest(line=line):
+                self.assertIsNone(smoke.KERNEL_FAILURE_RE.search(line))
+
+    def test_true_kernel_message_families_fail_with_or_without_printk_prefix(self):
+        for message in self.KERNEL_MESSAGES:
+            for prefix in ("", "[   30.100000] ", "<0>[   30.100000] ",
+                           "<0> [   30.100000] ", "<0>\t", "<0> "):
+                with self.subTest(message=message, prefix=prefix):
+                    output = "ordinary boot output\r\n" + prefix + message
+                    with self.assertRaisesRegex(smoke.SmokeFailure, "kernel failure"):
+                        self.monitor(output).check()
+                    result = good_result()
+                    result.output += prefix + message + "\n"
+                    with self.assertRaisesRegex(smoke.SmokeFailure, "kernel failure"):
+                        smoke.validate_test_boot(result, RELEASE, SOURCE)
+
+    def test_partial_serial_bug_is_detected_when_signature_arrives_without_newline(self):
+        monitor = self.monitor("ordinary boot output\n[   30.100000] BU")
+        monitor.check()
+        monitor.data.extend(b"G: bad page")
+        with self.assertRaisesRegex(smoke.SmokeFailure, "kernel failure"):
+            monitor.check()
+
+    def test_fragmented_libinput_warning_never_becomes_a_kernel_failure(self):
+        monitor = self.monitor("")
+        for byte in (self.WARNINGS[0] + "\n").encode():
+            monitor.data.append(byte)
+            monitor.check()
+
+    def test_real_bug_after_userspace_warning_is_not_hidden(self):
+        output = self.WARNINGS[0] + "\r\n[   30.100000] kernel BUG at mm/slub.c:123!"
+        with self.assertRaisesRegex(smoke.SmokeFailure, "kernel failure"):
+            self.monitor(output).check()
+
+    def test_printk_uptime_detects_bug_after_unfinished_userspace_line(self):
+        for prefix in ("[   30.100000] ", "<0> [   30.100000] "):
+            with self.subTest(prefix=prefix):
+                monitor = self.monitor("unfinished desktop message " + prefix + "BU")
+                monitor.check()
+                monitor.data.extend(b"G: bad page")
+                with self.assertRaisesRegex(smoke.SmokeFailure, "kernel failure"):
+                    monitor.check()
+
+    def test_unprefixed_kernel_words_still_require_a_line_boundary(self):
+        for message in self.KERNEL_MESSAGES:
+            with self.subTest(message=message):
+                self.assertIsNone(smoke.KERNEL_FAILURE_RE.search("desktop diagnostic text " + message))
+
+    def test_guest_failure_marker_remains_fatal_after_libinput_warning(self):
+        output = self.WARNINGS[0] + "\nP2:FAIL:INPUT_PROBE\n"
+        with self.assertRaisesRegex(smoke.SmokeFailure, "guest reported failure"):
+            self.monitor(output).check()
 
 
 class TestScreenEvidence(unittest.TestCase):
