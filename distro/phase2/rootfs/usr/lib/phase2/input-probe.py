@@ -13,6 +13,14 @@ def emit(value):
     print("P2:" + value, flush=True)
 
 
+def require_wayland_display(display):
+    # Debian's GTK 3 GIR package does not ship a GdkWayland namespace. Check
+    # the actual instance's registered GType instead of importing that typelib.
+    # GTK 3.24.49 gdk/wayland/gdkdisplay-wayland.c registers GdkWaylandDisplay.
+    if getattr(getattr(display, "__gtype__", None), "name", None) != "GdkWaylandDisplay":
+        raise RuntimeError("not a native Wayland display")
+
+
 class CallbackGuard:
     """Turn GI's normally swallowed callback exceptions into a failed probe."""
 
@@ -49,11 +57,9 @@ def main():
     gi.require_foreign("cairo")
     gi.require_version("Gtk", "3.0")
     gi.require_version("Gdk", "3.0")
-    gi.require_version("GdkWayland", "3.0")
-    from gi.repository import Gdk, GdkWayland, GLib, Gtk
+    from gi.repository import Gdk, GLib, Gtk
 
-    if not isinstance(Gdk.Display.get_default(), GdkWayland.WaylandDisplay):
-        raise RuntimeError("not a native Wayland display")
+    require_wayland_display(Gdk.Display.get_default())
 
     def stop_loop():
         # Some signals can run during show_all(), before Gtk.main() starts.

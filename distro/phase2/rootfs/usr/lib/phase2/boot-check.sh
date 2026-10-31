@@ -64,20 +64,16 @@ ping -c 1 -W 3 10.0.2.2
 emit NETWORK_OK
 reason=UDEV
 udevadm settle --timeout=30
+reason=DRM_CHECK
+# shellcheck source=../rootfs/usr/lib/phase2/drm-check.sh
+source /usr/lib/phase2/drm-check.sh
 reason=NO_DRM
-drm_found=false
-shopt -s nullglob
-for card in /sys/class/drm/card[0-9]*; do
-    [[ -e "$card/device/driver" ]] || continue
-    if [[ "$(basename "$(readlink -f "$card/device/driver")")" == virtio_gpu ]]; then
-        drm_found=true
-    fi
-done
-[[ "$drm_found" == true ]]
+phase2_find_virtio_drm
 emit DRM_OK
 reason=INPUT_DEVICES
 keyboard_found=false
 pointer_found=false
+shopt -s nullglob
 for input in /sys/class/input/event*/device/name; do
     name=$(cat "$input")
     case "$name" in

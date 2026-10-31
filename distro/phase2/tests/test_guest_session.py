@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import ModuleType, SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 
 PHASE = Path(__file__).resolve().parents[1]
@@ -21,6 +23,53 @@ def load_module(name, path):
 sys.modules.setdefault("probe_state", load_module("probe_state", GUEST / "probe_state.py"))
 probe = load_module("input_probe", GUEST / "input-probe.py")
 terminal = load_module("terminal_state", GUEST / "terminal_state.py")
+
+
+class WaylandDisplayTests(unittest.TestCase):
+    def test_native_wayland_runtime_gtype_is_accepted(self):
+        display = SimpleNamespace(__gtype__=SimpleNamespace(name="GdkWaylandDisplay"))
+        probe.require_wayland_display(display)
+
+    def test_missing_display_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "not a native Wayland display"):
+            probe.require_wayland_display(None)
+
+    def test_x11_and_other_runtime_backends_are_rejected(self):
+        for name in ("GdkX11Display", "GdkBroadwayDisplay", "GdkDisplay", ""):
+            with self.subTest(name=name), self.assertRaises(RuntimeError):
+                probe.require_wayland_display(SimpleNamespace(__gtype__=SimpleNamespace(name=name)))
+
+    def test_generic_object_cannot_substitute_for_runtime_gtype(self):
+        with self.assertRaises(RuntimeError):
+            probe.require_wayland_display(object())
+
+    def test_startup_does_not_require_or_import_optional_gdkwayland_namespace(self):
+        gi = ModuleType("gi")
+        gi.require_foreign = Mock()
+        gi.require_version = Mock()
+        repository = ModuleType("gi.repository")
+        display = SimpleNamespace(__gtype__=SimpleNamespace(name="GdkWaylandDisplay"))
+        repository.Gdk = SimpleNamespace(Display=SimpleNamespace(get_default=lambda: display))
+        repository.GLib = SimpleNamespace()
+        repository.Gtk = SimpleNamespace()
+        # No GdkWayland attribute/typelib exists, just like the pinned package.
+        gi.repository = repository
+        with patch.dict(sys.modules, {"gi": gi, "gi.repository": repository}), \
+                patch.object(probe.os, "getuid", return_value=1000), \
+                patch.dict(probe.os.environ, {"GDK_BACKEND": "wayland"}), \
+                patch.object(probe, "require_wayland_display", side_effect=RuntimeError("display check reached")) as check:
+            with self.assertRaisesRegex(RuntimeError, "display check reached"):
+                probe.main()
+        check.assert_called_once_with(display)
+        self.assertEqual([call.args for call in gi.require_version.call_args_list],
+                         [("Gtk", "3.0"), ("Gdk", "3.0")])
+        gi.require_foreign.assert_called_once_with("cairo")
+
+    def test_wayland_backend_environment_is_still_mandatory(self):
+        with patch.object(probe.os, "getuid", return_value=1000), \
+                patch.dict(probe.os.environ, {"GDK_BACKEND": "x11"}):
+            with self.assertRaisesRegex(RuntimeError, "non-root Wayland session"):
+                probe.main()
 
 
 class CallbackGuardTests(unittest.TestCase):
