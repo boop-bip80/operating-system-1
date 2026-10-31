@@ -24,8 +24,14 @@ make -C "$REPO_ROOT" O="$KERNEL_BUILD_DIR" ARCH=x86_64 -j"$JOBS" bzImage
 [[ -s "$KERNEL_BUILD_DIR/arch/x86/boot/bzImage" ]] || phase1_die 'AC-02: no bzImage produced'
 [[ -x "$KERNEL_BUILD_DIR/usr/gen_init_cpio" ]] || \
     make -C "$REPO_ROOT" O="$KERNEL_BUILD_DIR" ARCH=x86_64 usr/gen_init_cpio
-make -s -C "$REPO_ROOT" O="$KERNEL_BUILD_DIR" ARCH=x86_64 kernelrelease > "$OUTPUT_DIR/kernelrelease"
+kernel_release=$(make -s --no-print-directory -C "$REPO_ROOT" \
+    O="$KERNEL_BUILD_DIR" ARCH=x86_64 kernelrelease)
+# Nested Kbuild makes otherwise add "Entering directory" and "Leaving directory"
+# lines to stdout, corrupting the guest release identity and its test manifest.
+[[ "$kernel_release" =~ ^[A-Za-z0-9._+-]+$ ]] || \
+    phase1_die 'AC-02: kernelrelease is not exactly one valid release token'
+printf '%s\n' "$kernel_release" > "$OUTPUT_DIR/kernelrelease"
 install -m 644 "$KERNEL_BUILD_DIR/.config" "$OUTPUT_DIR/kernel.config"
 [[ "$(python3 "$PHASE_DIR/scripts/manifest.py" fingerprint)" == "$(<"$OUTPUT_DIR/source-fingerprint")" ]] || \
     phase1_die 'AC-01: source inputs changed during kernel build; rebuild'
-phase1_log "kernel build complete: $(<"$OUTPUT_DIR/kernelrelease")"
+phase1_log "kernel build complete: $kernel_release"
