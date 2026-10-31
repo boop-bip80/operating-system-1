@@ -1,0 +1,8 @@
+Package: phase2-proof
+Version: 1.0
+Section: misc
+Priority: optional
+Architecture: all
+Maintainer: Phase 2 build <phase2@localhost>
+Description: Offline package-manager acceptance fixture
+ This dependency-free package is installed and removed during the boot check.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Fail closed on an unsuccessful desktop startup
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/phase2/failure.sh
+StandardInput=null
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0

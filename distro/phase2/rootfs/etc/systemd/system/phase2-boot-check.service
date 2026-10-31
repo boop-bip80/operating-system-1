@@ -1,0 +1,16 @@
+[Unit]
+Description=Phase 2 userspace and hardware acceptance checks
+After=local-fs.target systemd-udev-trigger.service systemd-networkd.service
+Wants=systemd-networkd.service
+Before=phase2-desktop.service phase2-log.service
+OnFailure=phase2-failure.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/phase2/boot-check.sh
+RemainAfterExit=yes
+TimeoutStartSec=150
+StandardInput=null
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0

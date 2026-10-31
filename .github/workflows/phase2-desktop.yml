@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: GPL-2.0
+name: Phase 2 graphical distro
+
+on:
+  push:
+    branches: [rcu-free-v3]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase2-${{ github.workflow }}-${{ github.ref }}
+  # A newer push supersedes an obsolete build, not completed evidence.
+  cancel-in-progress: true
+
+jobs:
+  build-and-desktop:
+    name: Build and boot UEFI desktop (QEMU TCG)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      JOBS: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record CI environment and source identity
+        run: |
+          set -euo pipefail
+          mkdir -p .build/phase2/logs
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          fields = (
+              "GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_REF",
+              "GITHUB_EVENT_NAME", "GITHUB_WORKFLOW", "GITHUB_RUN_ID",
+              "GITHUB_RUN_ATTEMPT", "RUNNER_OS", "RUNNER_ARCH",
+              "ImageOS", "ImageVersion",
+          )
+          evidence = {key: os.environ.get(key, "") for key in fields}
+          evidence["source_sha"] = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          epoch = subprocess.check_output(
+              ["git", "log", "-1", "--format=%ct"], text=True
+          ).strip()
+          evidence["source_date_epoch"] = int(epoch)
+          pathlib.Path(".build/phase2/logs/ci-environment.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+          )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write("SOURCE_DATE_EPOCH=" + epoch + "\n")
+          PY
+
+      - name: Install kernel, distribution, image and VM dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev pkg-config \
+            rsync cpio gzip bzip2 xz-utils curl ca-certificates \
+            mmdebstrap debian-archive-keyring dpkg-dev gnupg \
+            qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin \
+            mtools dosfstools fdisk e2fsprogs util-linux \
+            shellcheck file python3 python3-pil git perl binutils
+          dpkg-query -W -f='${Package}\t${Version}\n' \
+            > .build/phase2/logs/host-packages.log
+
+      - name: Check scripts and host-side validators
+        run: make -C distro/phase2 check
+
+      - name: Build this repository's graphical kernel
+        run: make -C distro/phase2 kernel
+
+      - name: Build signed-snapshot userspace and UEFI disk image
+        run: |
+          sudo --preserve-env=SOURCE_DATE_EPOCH,JOBS \
+            make -C distro/phase2 userspace image
+
+      - name: Bind the build outputs to source and dependency provenance
+        run: make -C distro/phase2 manifest
+
+      - name: Exercise real DRM graphics, input, persistence and negative boot
+        run: make -C distro/phase2 test
+
+      - name: Verify acceptance evidence and artifact identity
+        run: make -C distro/phase2 verify
+
+      - name: Collect available diagnostics and bootable artifacts
+        if: always()
+        run: make -C distro/phase2 artifact
+
+      - name: Upload evidence for this exact run and attempt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: phase2-${{ github.sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: .build/phase2/artifacts/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

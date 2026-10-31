@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Immutable guest inputs. Host package/tool versions are recorded by the manifest.
+PHASE2_BASE_COMMIT=16a28b193ffcbe213b876960b2cb910627feaee2
+DEBIAN_SUITE=trixie
+DEBIAN_ARCH=amd64
+DEBIAN_SNAPSHOT=20261001T000000Z
+DEBIAN_MIRROR=https://snapshot.debian.org/archive/debian/20261001T000000Z/
+DEBIAN_SECURITY_MIRROR=https://snapshot.debian.org/archive/debian-security/20261001T000000Z/
+DEBIAN_KEYRING_VERSION=2025.1
+DEBIAN_KEYRING_URL=https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb
+# Published by https://packages.debian.org/trixie/all/debian-archive-keyring/download
+DEBIAN_KEYRING_SHA256=9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac
+PHASE2_DISK_GUID=a4055748-59f3-496f-990b-096a4def0200
+PHASE2_ESP_PARTUUID=a4055748-59f3-496f-990b-096a4def0201
+PHASE2_ROOT_PARTUUID=a4055748-59f3-496f-990b-096a4def0202
+PHASE2_ROOT_UUID=2b129e96-7909-4ab1-8a97-f38a1a14f202
+PHASE2_ROOT_LABEL=PHASE2ROOT
+PHASE2_ESP_ID=50483245
+PHASE2_IMAGE_MIB=4096
+PHASE2_ESP_MIB=256
+QEMU_MACHINE=q35
+QEMU_CPU_COUNT=2
+QEMU_MEMORY_MIB=2048
+PHASE2_BOOT_TIMEOUT=300

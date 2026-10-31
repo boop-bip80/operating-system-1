@@ -1,0 +1,31 @@
+[Unit]
+Description=Phase 2 non-root Wayland desktop
+Requires=phase2-boot-check.service phase2-log.service systemd-logind.service dbus.service
+After=phase2-boot-check.service phase2-log.service systemd-logind.service dbus.service systemd-user-sessions.service
+After=getty@tty1.service
+Conflicts=getty@tty1.service
+Before=graphical.target
+OnFailure=phase2-failure.service
+
+[Service]
+Type=simple
+User=desktop
+Group=desktop
+PAMName=login
+WorkingDirectory=/home/desktop
+Environment=XDG_SESSION_TYPE=wayland XDG_SESSION_CLASS=user LIBSEAT_BACKEND=logind
+Environment=WAYLAND_DISPLAY=wayland-0 GDK_BACKEND=wayland
+ExecStart=/usr/lib/phase2/start-desktop.sh
+TimeoutStopSec=15
+TTYPath=/dev/tty1
+StandardInput=tty-fail
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+UtmpIdentifier=tty1
+UtmpMode=user
+StandardOutput=append:/var/log/phase2/session.log
+StandardError=append:/var/log/phase2/session.log
+
+[Install]
+WantedBy=graphical.target

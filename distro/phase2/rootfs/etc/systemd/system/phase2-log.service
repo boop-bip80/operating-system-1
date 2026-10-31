@@ -1,0 +1,13 @@
+[Unit]
+Description=Phase 2 serial evidence bridge
+Requires=phase2-boot-check.service
+After=phase2-boot-check.service
+Before=phase2-desktop.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tail --lines=+1 --follow=name --retry --sleep-interval=0.1 /var/log/phase2/session.log
+StandardInput=null
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0
