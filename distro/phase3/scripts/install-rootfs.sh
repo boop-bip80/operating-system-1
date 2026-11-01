@@ -47,7 +47,27 @@ printf 'phase3: installing from existing pinned/signed Debian %s snapshot\n' "$P
 read -r -a guest_packages <<< "$PHASE3_GUEST_PACKAGES"
 (( ${#guest_packages[@]} >= 4 ))
 export DEBIAN_FRONTEND=noninteractive
+# P2 intentionally configures 10.0.2.3 for the QEMU guest. Host chroot APT
+# cannot resolve through a QEMU-only DNS gateway, so borrow the host resolver
+# only while downloading from the EXISTING signed pinned snapshot sources.
+# Preserve the exact original guest file bytes even when apt fails.
+guest_resolver="$rootfs/etc/resolv.conf"
+[[ -f "$guest_resolver" && ! -L "$guest_resolver" && -f /etc/resolv.conf ]]
+resolver_backup=$(mktemp -- "$p3_out/guest-resolver.XXXXXXXX")
+cp -- "$guest_resolver" "$resolver_backup"
+cmp -s -- "$guest_resolver" "$resolver_backup"
+restore_guest_resolver() {
+    if [[ -f "$resolver_backup" && ! -L "$resolver_backup" ]]; then
+        cp -- "$resolver_backup" "$guest_resolver"
+        cmp -s -- "$resolver_backup" "$guest_resolver"
+        rm -- "$resolver_backup"
+    fi
+}
+trap restore_guest_resolver EXIT
+cp --dereference -- /etc/resolv.conf "$guest_resolver"
 chroot "$rootfs" apt-get --assume-yes --no-install-recommends install "${guest_packages[@]}"
+restore_guest_resolver
+[[ ! -e "$resolver_backup" && ! -L "$resolver_backup" ]]
 [[ -z "$(chroot "$rootfs" dpkg --audit)" ]]
 for guest_package in "${guest_packages[@]}"; do
     chroot "$rootfs" dpkg-query -W "$guest_package" >/dev/null
