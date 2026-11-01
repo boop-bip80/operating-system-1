@@ -1077,10 +1077,29 @@ def boot(name: str, timeout: float, release: str, source: str,
             while result.nonce == previous:
                 result.nonce = secrets.token_hex(16)
 
-            def wait_observed(predicate, description: str) -> None:
+            def wait_observed(predicate, description: str, *,
+                              max_wait: float | None = None) -> None:
+                # Post-Close focus is a short asynchronous Sway IPC handoff.
+                # An absent observation must fail promptly with source evidence,
+                # not consume the entire 300s QEMU boot budget.
+                if max_wait is not None and not (0 < max_wait <= 30):
+                    raise ValueError("invalid Sway observation timeout")
+                observed_deadline = (deadline if max_wait is None else
+                                     min(deadline, time.monotonic() + max_wait))
                 while not predicate(lines(monitor.output())):
                     monitor.check()
-                    if time.monotonic() >= deadline:
+                    if time.monotonic() >= observed_deadline:
+                        if max_wait is not None:
+                            # Diagnostic is derived only from observed serial
+                            # Sway get_tree; never fabricate activation markers.
+                            last_ipc = next((
+                                item[len("P3:IPC_TREE:"):][:240]
+                                for item in reversed(lines(monitor.output()))
+                                if item.startswith("P3:IPC_TREE:")
+                            ), "none")
+                            raise Phase3Failure(
+                                "timed out waiting for " + description +
+                                "; last source IPC_TREE=" + last_ipc)
                         raise Phase3Failure("timed out waiting for " + description)
                     time.sleep(.05)
 
@@ -1259,6 +1278,7 @@ def boot(name: str, timeout: float, release: str, source: str,
                     and m == f"P3:WINDOW_ACTIVATED:{result.second_window_id}"
                     for i, m in enumerate(items)),
                 "surviving terminal B focus after Sway Dock kill",
+                max_wait=15,
             )
             result.close_via_dock = True
             result.screenshots["closed"], closed = capture(

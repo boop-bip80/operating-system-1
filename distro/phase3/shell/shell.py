@@ -369,6 +369,27 @@ def window_events(previous: dict[int, Toplevel],
     return events
 
 
+def close_handoff_candidate(
+    closed_id: int, successor_id: int, successor_pid: int,
+    current: dict[int, Toplevel],
+) -> int | None:
+    """Only focus a still-live Sway survivor after a proved Close and PID exit.
+
+    The previous get_tree supplied the successor's con_id and PID. A subsequent
+    real get_tree must show the closed leaf absent and that same survivor still
+    visible, unminimized and unfocused; never override an already focused app.
+    """
+    if (closed_id in current or type(successor_id) is not int
+            or successor_id <= 0 or type(successor_pid) is not int
+            or successor_pid <= 0 or any(item.focused for item in current.values())):
+        return None
+    item = current.get(successor_id)
+    if (item is None or item.con_id != successor_id
+            or item.pid != successor_pid or item.minimized or not item.visible):
+        return None
+    return valid_con_id(item.con_id)
+
+
 def parse_proc_stat(content: str) -> tuple[int, str, int]:
     """Extract PID, state and boot-tick starttime from Linux /proc/<pid>/stat.
 
@@ -504,6 +525,8 @@ class Phase3Shell:
         self._dock_signature: tuple[Any, ...] | None = None
         self._pending_focus: set[int] = set()
         self._pending_process_exits: dict[int, ProcessWatch] = {}
+        # Close→(survivor con_id, survivor PID, deadline), all from real Sway.
+        self._pending_close_handoffs: dict[int, tuple[int, int, float]] = {}
         self._launch_requests: list[tuple[float, str]] = []
         self._ready = False
         self._startup_checks = 0
@@ -897,6 +920,20 @@ class Phase3Shell:
             # actual Sway tree removal AND same-process /proc termination.
             if watch is not None and len(self._pending_process_exits) < MAX_PROCESS_WATCHES:
                 self._pending_process_exits[con_id] = watch
+                # Pin one existing, visibly live successor by actual Sway
+                # con_id and PID; never focus it from the kill ACK alone.
+                survivors = sorted(
+                    (candidate.con_id, candidate.pid)
+                    for candidate in self.toplevels.values()
+                    if candidate.con_id != con_id and candidate.visible
+                    and not candidate.minimized and candidate.pid is not None
+                )
+                if survivors and len(self._pending_close_handoffs) < MAX_PROCESS_WATCHES:
+                    successor_id, successor_pid = survivors[0]
+                    self._pending_close_handoffs[con_id] = (
+                        successor_id, successor_pid,
+                        time.monotonic() + PROCESS_EXIT_TIMEOUT,
+                    )
         GLib.timeout_add(175, self._poll_once)
 
     def _window_menu(self, widget: Gtk.Button) -> None:
@@ -1011,7 +1048,8 @@ class Phase3Shell:
         self._poll_windows()
         return False
 
-    def _check_process_exits(self, observed: dict[int, Toplevel]) -> None:
+    def _check_process_exits(self, observed: dict[int, Toplevel]) -> set[int]:
+        exited: set[int] = set()
         for con_id, watch in list(self._pending_process_exits.items()):
             if time.monotonic() > watch.deadline:
                 print("phase3: Close process proof timed out for " + str(con_id),
@@ -1035,7 +1073,9 @@ class Phase3Shell:
                 del self._pending_process_exits[con_id]
             elif status == "exited":
                 emit("PROCESS_EXITED:" + str(con_id) + ":" + str(watch.pid))
+                exited.add(con_id)
                 del self._pending_process_exits[con_id]
+        return exited
 
     def _check_ready(self) -> bool:
         if self._ready:
@@ -1128,8 +1168,25 @@ class Phase3Shell:
                 self._pending_focus.remove(con_id)
         for con_id in old.keys() - current.keys():
             self._pending_focus.discard(con_id)
-        self._check_process_exits(current)
+        exited_ids = self._check_process_exits(current)
         now = time.monotonic()
+        for closed_id, handoff in list(self._pending_close_handoffs.items()):
+            successor_id, successor_pid, expires = handoff
+            if now > expires:
+                # Timed out, crashed /proc probe, or recycled PID: no focus.
+                del self._pending_close_handoffs[closed_id]
+                continue
+            if closed_id not in exited_ids:
+                continue
+            del self._pending_close_handoffs[closed_id]
+            survivor = close_handoff_candidate(
+                closed_id, successor_id, successor_pid, current,
+            )
+            if survivor is not None and self._sway_command(survivor, "focus"):
+                # IPC ACK is only a request. The next fresh get_tree must
+                # observe B focused before existing WINDOW_ACTIVATED is emitted.
+                self._pending_focus.add(survivor)
+                GLib.timeout_add(175, self._poll_once)
         self._launch_requests = [
             request for request in self._launch_requests
             if now - request[0] <= LAUNCH_TIMEOUT
