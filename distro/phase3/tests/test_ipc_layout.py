@@ -81,7 +81,7 @@ def native_arrays():
           "rect": {"x": 0, "y": 0, "width": 1024, "height": 768},
           "scale": 1.0, "current_mode": {"width": 1024, "height": 768}}],
         [{"name": "1", "visible": True, "output": "Virtual-1",
-          "rect": {"x": 0, "y": 38, "width": 1024, "height": 662}}],
+          "rect": {"x": 4, "y": 42, "width": 1016, "height": 646}}],
     )
 
 
@@ -118,11 +118,65 @@ class RealSwayWorkspaceContract(unittest.TestCase):
             "source": "sway.get_outputs+get_workspaces",
             "output": "Virtual-1", "workspace": "1",
             "output_rect": {"x": 0, "y": 0, "width": 1024, "height": 768},
-            "workspace_rect": {"x": 0, "y": 38, "width": 1024, "height": 662},
+            "workspace_rect": {"x": 4, "y": 42, "width": 1016, "height": 646},
             "mode": {"width": 1024, "height": 768},
             "scale": 1.0, "top_exclusive": 38, "dock_exclusive": 68,
         })
         offline_layout()(serial_items(canonical_marker(proof)))
+
+    def test_small_symmetric_insets_and_dock_margin_bounds_are_accepted(self):
+        ns, _ = live_shell_pure()
+        valid_rects = (
+            {"x": 4, "y": 42, "width": 1016, "height": 646},  # genuine QEMU/Sway gaps=4 + Dock margin8
+            {"x": 0, "y": 38, "width": 1024, "height": 662},  # no extra Sway gap
+            {"x": 4, "y": 38, "width": 1016, "height": 662},  # maximum symmetric horizontal inset only
+            {"x": 0, "y": 42, "width": 1024, "height": 650},  # top extra4, bottom extra8
+            {"x": 4, "y": 42, "width": 1016, "height": 646},  # all bounds at maximum
+        )
+        for rect in valid_rects:
+            with self.subTest(rect=rect):
+                outputs, workspaces = native_arrays()
+                workspaces[0]["rect"] = dict(rect)
+                proof = ns["layout_proof"](outputs, workspaces, 38, 68)
+                self.assertEqual(proof["workspace_rect"], rect)
+                marker = canonical_marker(proof)
+                offline_layout()(serial_items(marker))
+                _, replay = smoke.ipc_layout_from_output(
+                    "\n".join(serial_items(marker)) + "\n")
+                self.assertEqual(replay["workspace_rect"], rect)
+
+    def test_asymmetric_or_oversized_sway_gaps_and_missing_zones_fail_all_oracles(self):
+        ns, _ = live_shell_pure()
+        invalid = (
+            {"x": 5, "y": 42, "width": 1014, "height": 646},   # symmetric but over maximum
+            {"x": 4, "y": 42, "width": 1015, "height": 646},   # asymmetric right inset 5
+            {"x": -1, "y": 42, "width": 1026, "height": 646},  # both horizontal insets negative
+            {"x": 0, "y": 42, "width": 10, "height": 646},     # enormous right inset
+            {"x": 20, "y": 42, "width": 984, "height": 646},   # enormous symmetric inset
+            {"x": 4, "y": 37, "width": 1016, "height": 663},   # topbar 38 not reserved
+            {"x": 4, "y": 43, "width": 1016, "height": 645},   # top extra5 >4
+            {"x": 4, "y": 42, "width": 1016, "height": 660},   # Dock zone 68 not reserved
+            {"x": 4, "y": 42, "width": 1016, "height": 645},   # bottom extra13 >12
+            {"x": 0, "y": 0, "width": 1024, "height": 768},    # full output with neither reservation
+            {"x": 4, "y": 42, "width": 1050, "height": 646},   # out of output bounds
+        )
+        for rect in invalid:
+            with self.subTest(rect=rect):
+                outputs, workspaces = native_arrays()
+                workspaces[0]["rect"] = dict(rect)
+                with self.assertRaises(ValueError):
+                    ns["layout_proof"](outputs, workspaces, 38, 68)
+                # The canonical JSON marker is not sufficient. Both host
+                # and offline verification must independently reject geometry.
+                outputs, workspaces = native_arrays()
+                proof = ns["layout_proof"](outputs, workspaces, 38, 68)
+                proof["workspace_rect"] = dict(rect)
+                marker = canonical_marker(proof)
+                with self.assertRaises(ValueError):
+                    offline_layout()(serial_items(marker))
+                with self.assertRaises(smoke.Phase3Failure):
+                    smoke.ipc_layout_from_output(
+                        "\n".join(serial_items(marker)) + "\n")
 
     def test_actual_workspace_rect_not_full_monitor_is_required(self):
         ns, _ = live_shell_pure()
@@ -269,8 +323,10 @@ class HostNativeLayoutOracle(unittest.TestCase):
             "\n".join(serial_items(marker)) + "\n",
         )
         self.assertEqual(position, 2)
-        self.assertEqual(value["workspace_rect"]["y"], 38)
-        self.assertEqual(value["workspace_rect"]["height"], 662)
+        self.assertEqual(value["workspace_rect"]["x"], 4)
+        self.assertEqual(value["workspace_rect"]["width"], 1016)
+        self.assertEqual(value["workspace_rect"]["y"], 42)
+        self.assertEqual(value["workspace_rect"]["height"], 646)
 
     def test_host_rejects_forged_and_duplicated_layout_json(self):
         marker = self.fixture()

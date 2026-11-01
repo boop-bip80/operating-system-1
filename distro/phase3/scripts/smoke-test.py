@@ -181,10 +181,22 @@ def ipc_layout_from_output(output: str) -> tuple[int, dict]:
         raise Phase3Failure("Sway IPC output geometry does not match native QEMU scanout")
     top = layout["top_exclusive"]
     bottom = layout["dock_exclusive"]
-    if (type(top) is not int or type(bottom) is not int or top != 38 or bottom != 68 or
-            workarea["x"] != 0 or workarea["width"] != output_rect["width"] or
-            workarea["height"] <= 0 or workarea["y"] < top or
-            workarea["y"] + workarea["height"] > output_rect["height"] - bottom):
+    if type(top) is not int or type(bottom) is not int or top != 38 or bottom != 68:
+        raise Phase3Failure("original topbar/Dock exclusive zones were not source-bound")
+    # Sway's configured inner gap is 4px and may inset the real workspace.
+    # Distinguish that small symmetric compositor gap from missing 38/68px
+    # layer-shell reservations; no fabricated full-output rectangle can pass.
+    left = workarea["x"] - output_rect["x"]
+    right = output_rect["x"] + output_rect["width"] - (
+        workarea["x"] + workarea["width"]
+    )
+    top_extra = workarea["y"] - (output_rect["y"] + top)
+    bottom_extra = output_rect["y"] + output_rect["height"] - bottom - (
+        workarea["y"] + workarea["height"]
+    )
+    if (not 0 <= left == right <= 4 or not 0 <= top_extra <= 4 or
+            not 0 <= bottom_extra <= 12 or
+            workarea["width"] <= 0 or workarea["height"] <= 0):
         raise Phase3Failure("original topbar/Dock did not reserve real Sway workarea")
     return position, layout
 

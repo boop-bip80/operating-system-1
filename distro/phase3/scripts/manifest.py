@@ -247,12 +247,20 @@ def check_native_layout(items: list[str]) -> None:
             mode == {"width": 1024, "height": 768} and
             output == {"x": 0, "y": 0, "width": 1024, "height": 768},
             "Sway native KMS output geometry/mode mismatch")
-    require(workspace["x"] == output["x"] and
-            workspace["width"] == output["width"] and
-            workspace["y"] >= output["y"] + value["top_exclusive"] and
-            workspace["height"] > 0 and
-            workspace["y"] + workspace["height"] <=
-                output["y"] + output["height"] - value["dock_exclusive"],
+    # Independently re-evaluate Sway's 4px configured inner-gap allowance.
+    # Requiring symmetric 0..4 horizontal insets plus the bounded top/bottom
+    # surplus preserves proof of actual 38px bar and 68px Dock reservations.
+    left = workspace["x"] - output["x"]
+    right = output["x"] + output["width"] - (
+        workspace["x"] + workspace["width"]
+    )
+    top_extra = workspace["y"] - (output["y"] + value["top_exclusive"])
+    bottom_extra = output["y"] + output["height"] - value["dock_exclusive"] - (
+        workspace["y"] + workspace["height"]
+    )
+    require(0 <= left == right <= 4 and 0 <= top_extra <= 4 and
+            0 <= bottom_extra <= 12 and
+            workspace["width"] > 0 and workspace["height"] > 0,
             "real Sway workspace usable rectangle did not reserve top bar and Dock")
     sway = next((i for i, marker in enumerate(items) if marker == "P3:SWAY_READY"), None)
     ipc = next((i for i, marker in enumerate(items) if marker.startswith("P3:IPC_TREE:")), None)

@@ -200,13 +200,21 @@ def layout_proof(
     if not isinstance(workspace_name, str) or not 0 < len(workspace_name) <= 64:
         raise ValueError("Sway returned a malformed workspace name")
     work_rect = _ipc_rect(workspace.get("rect"))
+    # Sway config's "gaps inner 4" legitimately insets the workspace from
+    # the full DRM output. The real 1024x768 guest reports x=4/width=1016.
+    # Accept only symmetric <=4px horizontal gaps, and tightly bounded
+    # vertical extras around the GTK-requested top38/bottom68 reservations.
+    # Anything missing either exclusive zone, shifted or clipped fails closed.
+    left_inset = work_rect["x"] - output_rect["x"]
+    right_inset = (output_rect["x"] + output_rect["width"]
+                   - work_rect["x"] - work_rect["width"])
+    top_extra = work_rect["y"] - output_rect["y"] - top_exclusive
+    bottom_extra = (output_rect["y"] + output_rect["height"]
+                    - dock_exclusive - work_rect["y"] - work_rect["height"])
     if not (
-        work_rect["x"] == output_rect["x"]
-        and work_rect["width"] == output_rect["width"]
-        and work_rect["y"] >= output_rect["y"] + top_exclusive
-        and work_rect["y"] + work_rect["height"] <= (
-            output_rect["y"] + output_rect["height"] - dock_exclusive
-        )
+        0 <= left_inset == right_inset <= 4
+        and 0 <= top_extra <= 4
+        and 0 <= bottom_extra <= 12
     ):
         # These rects have already passed the integer-only _ipc_rect gate.
         # Include only bounded numeric geometry, never raw Sway window titles,
