@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: GPL-2.0
+name: Phase 3 original desktop shell
+
+on:
+  push:
+    branches: [rcu-free-v3]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase3-${{ github.workflow }}-${{ github.ref }}
+  # New commits supersede pending work; completed evidence remains available.
+  cancel-in-progress: true
+
+jobs:
+  build-and-desktop:
+    name: Build and exercise original Wayland shell (QEMU TCG)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      JOBS: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record CI environment and immutable source identity
+        run: |
+          set -euo pipefail
+          mkdir -p .build/phase3/logs
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          fields = (
+              "GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_REF",
+              "GITHUB_EVENT_NAME", "GITHUB_WORKFLOW", "GITHUB_RUN_ID",
+              "GITHUB_RUN_ATTEMPT", "RUNNER_OS", "RUNNER_ARCH",
+              "ImageOS", "ImageVersion",
+          )
+          evidence = {key: os.environ.get(key, "") for key in fields}
+          evidence["source_sha"] = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          epoch = subprocess.check_output(
+              ["git", "show", "-s", "--format=%ct", "HEAD"], text=True
+          ).strip()
+          evidence["source_date_epoch"] = int(epoch)
+          Path(".build/phase3/logs/ci-environment.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+          )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write("SOURCE_DATE_EPOCH=" + epoch + "\n")
+          PY
+
+      - name: Install pinned-source build and QEMU verification prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev pkg-config \
+            rsync cpio gzip bzip2 xz-utils curl ca-certificates \
+            mmdebstrap debian-archive-keyring dpkg-dev gnupg \
+            qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin \
+            mtools dosfstools fdisk e2fsprogs util-linux \
+            shellcheck file python3 python3-pil git perl binutils
+          dpkg-query -W -f='${Package}\t${Version}\n' \
+            > .build/phase3/logs/host-packages.log
+
+      - name: Check desktop shell source, scripts and host-side validators
+        run: make -C distro/phase3 check
+
+      - name: Build this repository's x86-64 DRM-capable kernel
+        run: make -C distro/phase3 kernel
+
+      - name: Build signed-snapshot userspace and install original desktop shell
+        run: |
+          sudo --preserve-env=SOURCE_DATE_EPOCH,JOBS \
+            make -C distro/phase3 userspace
+
+      - name: Build standalone UEFI desktop disk and firmware inputs
+        run: |
+          sudo --preserve-env=SOURCE_DATE_EPOCH,JOBS \
+            make -C distro/phase3 image
+
+      - name: Bind source, Debian dependencies, shell and boot artifacts
+        run: make -C distro/phase3 manifest
+
+      - name: Exercise real DRM shell, UI input, persistence and negative controls
+        run: make -C distro/phase3 test
+
+      - name: Verify source-bound desktop acceptance and test evidence
+        run: make -C distro/phase3 verify
+
+      - name: Collect bootable desktop image and diagnostic evidence
+        if: ${{ always() }}
+        run: make -C distro/phase3 artifact
+
+      - name: Verify curated upload checksums
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          cd .build/phase3/artifacts
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Upload evidence for this exact commit, run and attempt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: phase3-${{ github.sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: .build/phase3/artifacts/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

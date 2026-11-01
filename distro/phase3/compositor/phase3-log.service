@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Phase 3 guest session diagnostics on serial console
+Requires=phase3-boot-check.service
+After=phase3-boot-check.service
+Before=phase3-desktop.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tail --lines=+1 --follow=name --retry --sleep-interval=0.1 /var/log/phase3/session.log
+Restart=on-failure
+RestartSec=1
+StandardInput=null
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0
+
+[Install]
+WantedBy=graphical.target

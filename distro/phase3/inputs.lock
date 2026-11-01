@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Phase 3 extends the exact Phase 2 signed Debian Trixie snapshot image.
+# Never source packages from host mirrors or the current moving Debian archive.
+PHASE3_BASE_PHASE=phase2
+PHASE3_DEBIAN_SUITE=trixie
+PHASE3_DEBIAN_SNAPSHOT=20261001T000000Z
+PHASE3_GUEST_PACKAGES="sway swaybg foot gir1.2-gtklayershell-0.1 libgtk-layer-shell0"
+PHASE3_COMPOSITOR=sway
+PHASE3_RENDERER=pixman
+PHASE3_BACKENDS=libinput,drm
+PHASE3_QEMU_MACHINE=q35
+PHASE3_GUEST_MEMORY_MIB=2048
+PHASE3_GUEST_CPU_COUNT=2
+PHASE3_BOOT_TIMEOUT=300

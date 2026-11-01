@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Phase 3 original non-root Wayland desktop
+Requires=phase2-boot-check.service phase3-boot-check.service phase3-log.service systemd-logind.service dbus.service
+After=phase2-boot-check.service phase3-boot-check.service phase3-log.service systemd-logind.service dbus.service systemd-user-sessions.service
+After=getty@tty1.service
+Conflicts=getty@tty1.service phase2-desktop.service
+Before=graphical.target
+OnFailure=phase2-failure.service
+
+[Service]
+Type=simple
+User=desktop
+Group=desktop
+PAMName=login
+WorkingDirectory=/home/desktop
+Environment=XDG_SESSION_TYPE=wayland XDG_SESSION_CLASS=user LIBSEAT_BACKEND=logind
+Environment=GDK_BACKEND=wayland WLR_RENDERER=pixman WLR_BACKENDS=libinput,drm
+ExecStart=/usr/lib/phase3/start-session.sh
+TimeoutStopSec=15
+TTYPath=/dev/tty1
+StandardInput=tty-fail
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+UtmpIdentifier=tty1
+UtmpMode=user
+StandardOutput=append:/var/log/phase3/session.log
+StandardError=append:/var/log/phase3/session.log
+
+[Install]
+WantedBy=graphical.target

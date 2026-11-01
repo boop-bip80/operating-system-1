@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Test-only typed-input evidence. Never supplied with a nonce by the image."""
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+STATE = Path("/home/desktop/.local/state/phase3")
+FLAG = Path("/run/phase3/test-mode")
+
+
+def main() -> int:
+    if os.getuid() != 1000 or not FLAG.is_file():
+        print("p3save is available only in the isolated acceptance guest", file=sys.stderr)
+        return 2
+    if len(sys.argv) != 2 or re.fullmatch(r"[0-9a-f]{32}", sys.argv[1]) is None:
+        print("usage: p3save <32-lowercase-hex-nonce>", file=sys.stderr)
+        return 2
+    if STATE.is_symlink() or not STATE.is_dir():
+        print("invalid persistent state directory", file=sys.stderr)
+        return 1
+    nonce = sys.argv[1]
+    temp_name = None
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=".nonce-", dir=STATE)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write((nonce + "\n").encode("ascii"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        target = STATE / "nonce"
+        if target.is_symlink():
+            raise ValueError("unsafe nonce target")
+        os.replace(temp_name, target)
+        temp_name = None
+        dirfd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+        preferences = Path("/home/desktop/.config/phase3/preferences.json")
+        if preferences.parent.is_symlink() or preferences.is_symlink():
+            raise ValueError("unsafe preferences path")
+        metadata = preferences.stat(follow_symlinks=False)
+        import stat
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 1000:
+            raise ValueError("preferences not owned by desktop user")
+        if metadata.st_size > 4096:
+            raise ValueError("oversized preferences")
+        import json
+        settings = json.loads(preferences.read_text(encoding="utf-8"))
+        if not isinstance(settings, dict) or settings.get("compact_dock") is not True:
+            raise ValueError("Compact Dock preference was not saved")
+        events = STATE / "events.log"
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        eventfd = os.open(events, flags, 0o600)
+        try:
+            os.write(eventfd, f"P3:PREFERENCE_VERIFIED:compact_dock=true:uid=1000\nP3:KEYBOARD_OK:{nonce}\n".encode("ascii"))
+            os.fsync(eventfd)
+        finally:
+            os.close(eventfd)
+    except (OSError, ValueError) as exc:
+        print(f"p3save failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+    print("Saved and synced.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,132 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Phase 3 desktop shell visual identity. All surfaces are genuine Wayland
+ * layer-shell windows, rendered by Sway rather than a generated screenshot.
+ */
+* {
+  font-family: "DejaVu Sans", sans-serif;
+  color: #ecf5ff;
+}
+
+window.phase3-bar {
+  background: rgba(14, 26, 43, 0.96);
+  border-bottom: 1px solid rgba(135, 177, 218, 0.32);
+}
+
+.phase3-brand {
+  color: #d6efff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+button.phase3-bar-button {
+  border-radius: 7px;
+  min-height: 24px;
+  padding: 1px 11px;
+  margin: 0;
+  color: #f3f9ff;
+  background: transparent;
+  border: 1px solid transparent;
+  box-shadow: none;
+  text-shadow: none;
+  font-size: 12px;
+}
+
+button.phase3-bar-button:hover,
+button.phase3-bar-button:active {
+  background: rgba(112, 169, 226, 0.24);
+  border-color: rgba(165, 210, 255, 0.22);
+}
+
+.phase3-clock,
+.phase3-current-app {
+  font-size: 12px;
+  color: #bbd5ec;
+}
+
+window.phase3-dock {
+  background: rgba(21, 37, 57, 0.92);
+  border: 1px solid rgba(165, 204, 244, 0.52);
+  border-radius: 15px;
+  box-shadow: 0 5px 19px rgba(0, 0, 0, 0.46);
+}
+
+button.phase3-dock-button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  box-shadow: none;
+  padding: 0 4px;
+  margin: 0;
+}
+
+button.phase3-dock-button:hover,
+button.phase3-dock-button:active,
+button.phase3-dock-button.phase3-active {
+  background: rgba(154, 211, 255, 0.23);
+  border-color: rgba(175, 210, 248, 0.3);
+}
+
+.phase3-dock-caption {
+  font-size: 9px;
+  color: #dfefff;
+}
+
+window.phase3-launcher {
+  background: rgba(22, 35, 55, 0.98);
+  border: 1px solid rgba(145, 190, 230, 0.55);
+  border-radius: 14px;
+  box-shadow: 0 12px 25px rgba(0, 0, 0, 0.55);
+}
+
+.phase3-heading {
+  font-size: 16px;
+  font-weight: 700;
+  color: #edf7ff;
+}
+
+button.phase3-close-button {
+  background: rgba(100, 138, 171, 0.23);
+  border: 1px solid rgba(180, 211, 241, 0.2);
+  box-shadow: none;
+  border-radius: 8px;
+  padding: 1px 8px;
+}
+
+entry.search {
+  color: #ecf4ff;
+  background: #122139;
+  border: 1px solid #6388a9;
+  border-radius: 8px;
+  padding: 6px 8px;
+  box-shadow: none;
+}
+
+button.phase3-launcher-row {
+  color: #e9f4ff;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  border-radius: 9px;
+  padding: 6px;
+  margin: 1px;
+}
+
+button.phase3-launcher-row:hover,
+button.phase3-launcher-row:focus {
+  background: rgba(129, 185, 237, 0.24);
+}
+
+menu {
+  background: #1a2a40;
+  border: 1px solid #7598b4;
+  border-radius: 8px;
+}
+
+menuitem:hover {
+  background: #456f96;
+}
+
+.phase3-running .phase3-dock-caption {
+  color: #91d6ff;
+  font-weight: 700;
+}

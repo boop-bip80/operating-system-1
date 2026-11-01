@@ -6,12 +6,21 @@ macOS-inspired desktop experience with original system applications and assets.
 This is not macOS, is not affiliated with Apple, and does not provide macOS
 binary compatibility.
 
-Current development stage: Phase 2 -- bootable distribution and graphical
-baseline IMPLEMENTED. Qualification is per source commit: acceptance requires
-two clean Phase 2 workflow attempts and a passing Phase 1 regression on the
-same SHA, with all evidence specified in docs/os/PHASE_02.md. The matching CI
-runs and artifacts, not this status line, establish whether a revision passed.
+Current development stage: Phase 3 / P3.1 original desktop-shell prototype
+IMPLEMENTATION IN PROGRESS; NOT QUALIFIED. P3.1 is a separate experimental
+Sway DRM/Pixman + original GTK3 GtkLayerShell top bar, Dock, and launcher,
+built on the Phase 2 kernel/distribution foundation. It is not yet an accepted
+desktop release; all P3-01 through P3-18 gates in docs/os/PHASE_03.md remain
+PENDING until evidence establishes otherwise.
 
+Phase 2's reference commit af6f0137132deb8b6f0d2d7e38584974478eff6a
+passed two complete independent Phase 2 workflow attempts and its same-SHA
+Phase 1 regression. That result does not qualify later source revisions,
+including Phase 3. Final P3.1 acceptance requires two clean Phase 3 attempts
+and successful Phase 1 and Phase 2 regressions for the exact same SHA.
+
+Phase 3 experimental workflow:
+https://github.com/boop-bip80/operating-system-1/actions/workflows/phase3-desktop.yml
 Phase 2 qualification workflow:
 https://github.com/boop-bip80/operating-system-1/actions/workflows/phase2-desktop.yml
 Same-commit Phase 1 regression workflow:
@@ -24,8 +33,9 @@ QEMU boot scenarios; the acceptance record and downloadable evidence are in
 docs/os/PHASE_01.md. Each newer commit must pass its own CI validation.
 Phase 2 adds signed-snapshot Debian userspace, apt/dpkg, a standalone UEFI
 disk image with this repository's kernel, and a non-root Weston/Wayland
-desktop with a terminal. The custom macOS-inspired shell, installer, live ISO,
-macOS application compatibility and bare-metal qualification are not included.
+desktop with a terminal. That reference image deliberately has no custom
+shell. Phase 3 develops a separate experimental shell; neither phase qualifies
+an installer, live ISO, macOS app compatibility or bare-metal deployment.
 
 Phase 2 quick start (isolated Linux x86-64 build VM)
 --------------------------------------------------
@@ -74,6 +84,7 @@ Documentation
 
     docs/os/PHASE_01.md              Scope, commands, acceptance criteria
     docs/os/PHASE_02.md              Graphical distro build and acceptance
+    docs/os/PHASE_03.md              Original shell P3.1 contract and gates
     docs/os/BUILD_PROVENANCE.md      Source/dependency pins and evidence
     docs/os/BOOT_TROUBLESHOOTING.md  Build and boot failure diagnosis
 
@@ -92,13 +103,15 @@ commit actually built rather than treating this historical baseline as HEAD.
 The release-candidate kernel and virtual-machine test coverage are not a
 production stability or hardware-qualification guarantee.
 
-The distro scaffolding is isolated in distro/phase1/ and distro/phase2/, and generated files
+The distro scaffolding is isolated in distro/phase1/, distro/phase2/, and
+distro/phase3/, and generated files
 are kept out of the kernel source directories. The root kernel Makefile is
 unchanged by the Phase 1 orchestration.
 
 See COPYING, LICENSES/, and Documentation/process/license-rules.rst for the
 Linux kernel's GPL-2.0 terms, syscall exception, and per-file licensing.
-BusyBox, Debian packages, Weston, GRUB and OVMF retain their own license obligations;
+BusyBox, Debian packages, Weston, Sway/wlroots, GtkLayerShell, GRUB and OVMF
+retain their own license obligations;
 source versions, checksums, and redistribution notes are recorded in
 docs/os/BUILD_PROVENANCE.md. Preserve these notices when redistributing.
 

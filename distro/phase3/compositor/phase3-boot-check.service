@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Phase 3 source, storage and input acceptance preflight
+Requires=phase2-boot-check.service
+After=phase2-boot-check.service
+Before=phase3-desktop.service
+OnFailure=phase2-failure.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/phase3/boot-check.sh
+RemainAfterExit=yes
+TimeoutStartSec=30
+StandardInput=null
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0
+
+[Install]
+WantedBy=graphical.target
