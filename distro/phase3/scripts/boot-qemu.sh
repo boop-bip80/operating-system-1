@@ -12,7 +12,7 @@ disk=
 qmp=
 vnc=
 usage() {
-    echo 'usage: boot-qemu.sh --mode run|test|negative [--name round1|round2|negative] [--disk absolute-qcow2-path] [--qmp private-socket] [--vnc N]' >&2
+    echo 'usage: boot-qemu.sh --mode run|test|negative|shell-negative [--name round1|round2|negative|shell-negative] [--disk absolute-qcow2-path] [--qmp private-socket] [--vnc N]' >&2
     exit 2
 }
 die() { echo "phase3 QEMU: $*" >&2; exit 1; }
@@ -26,9 +26,9 @@ while (( $# )); do
         *) usage ;;
     esac
 done
-[[ "$mode" == run || "$mode" == test || "$mode" == negative ]] || usage
+[[ "$mode" == run || "$mode" == test || "$mode" == negative || "$mode" == shell-negative ]] || usage
 if [[ -z "$name" ]]; then
-    if [[ "$mode" == negative ]]; then name=negative; else name=run; fi
+    if [[ "$mode" == negative || "$mode" == shell-negative ]]; then name="$mode"; else name=run; fi
 fi
 [[ "$name" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || usage
 [[ -z "$vnc" || ( "$mode" == run && "$vnc" =~ ^[0-9]{1,2}$ ) ]] || usage
@@ -72,8 +72,12 @@ args=(
 if [[ "$mode" != negative ]]; then
     args+=( -device "virtio-gpu-pci,xres=1024,yres=768" )
 fi
-if [[ "$mode" == test ]]; then
+if [[ "$mode" == test || "$mode" == shell-negative ]]; then
     args+=( -fw_cfg "name=opt/phase3/test,string=1" )
+fi
+if [[ "$mode" == shell-negative ]]; then
+    # Test-only, volatile fault gate. Retain the real DRM GPU and Sway startup.
+    args+=( -fw_cfg "name=opt/phase3/fail-shell,string=1" )
 fi
 if [[ -n "$vnc" ]]; then
     args+=( -vnc "127.0.0.1:$vnc" )

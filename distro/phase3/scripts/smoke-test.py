@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Phase 3 QEMU acceptance: actual Sway/Wayland UI, HID, storage and failure.
+"""Phase 3 QEMU acceptance: actual Sway/Wayland UI, HID, storage and fail-closed controls.
 
 This driver reuses Phase 2's independently regression-tested QMP/PPM transport.
 It does not generate screenshots or inject a challenge through serial, disk,
 firmware, kernel arguments, or a guest test fixture. A host nonce is created
 only after QMP has captured the original desktop framebuffer, then typed into
-the real foot terminal opened by clicking the real GTK Dock via emulated HID.
+the real foot terminal opened from the original GTK launcher via emulated HID.
+A second real foot client proves Dock focus switching and honest scratchpad
+hide/restore/kill behavior using compositor IPC and QMP scanout observations.
 """
 from __future__ import annotations
 
@@ -36,18 +38,39 @@ p2 = importlib.util.module_from_spec(P2_SPEC)
 sys.modules[P2_SPEC.name] = p2
 P2_SPEC.loader.exec_module(p2)
 
-SCREEN_STAGES = ("ready", "preferences", "foot", "saved", "desktop")
+SCREEN_STAGES = (
+    "ready", "launcher", "preferences", "foot", "saved", "second", "focused",
+    "menu_minimize", "hidden", "restored", "menu_close", "closed", "desktop",
+)
 NONCE_RE = re.compile(r"[0-9a-f]{32}\Z")
 RELEASE_RE = re.compile(r"[A-Za-z0-9._+\-]+\Z")
 FOCUS_RE = re.compile(r"P3:WINDOW_FOCUSED:([1-9][0-9]*)\Z")
+DISCOVERED_RE = re.compile(r"P3:WINDOW_DISCOVERED:([1-9][0-9]*):foot\Z")
+ACTIVATED_RE = re.compile(r"P3:WINDOW_ACTIVATED:([1-9][0-9]*)\Z")
+GTK_TARGET_RE = {name: re.compile(r"P3:" + name + r"_TARGET:([0-9]+):([0-9]+):([0-9]+):([0-9]+)\Z")
+                 for name in ("COMPACT", "TERMINAL")}
+IPC_PREFIX = "P3:IPC_TREE:"
 SOURCE_RE = re.compile(r"[0-9a-f]{40}\Z")
 SCREEN_BOX = (160, 75, 864, 680)
+# Sway foot floats centered at 760x530; text/active border begin near x132,y119.
+# A contains the host nonce, while B is a distinct, initially blank terminal.
+FOOT_CONTENT_BOX = (132, 116, 680, 284)
+MENU_POPUP_BOX = (380, 495, 690, 755)
+# Centered pinned Terminal icon only, above the Dock caption and below topbar.
+# GTK DND icon is 32px in round1; BUTTON icon is 16px after persisted compact.
+DOCK_ICON_BOX = (492, 704, 532, 740)
 DOCK_X, DOCK_Y = 512, 730
 MENU_X, MENU_Y = 150, 20
-COMPACT_X, COMPACT_Y = 60, 444
+# Launcher is a TOP/LEFT-anchored real GtkLayerShell surface (14px/43px).
+# Neither the Terminal row nor Compact checkbox has a static hitbox:
+# both clickable centers and dimensions come from mapped GTK allocations.
+LAUNCHER_BOX = (20, 52, 375, 420)
 BOOT_MARKERS = (
     "P3:USERSPACE:debian", "P3:ROOT_OK", "P3:DRM_OK",
-    "P3:DESKTOP_USER:1000", "P3:SWAY_READY", "P3:LAYER_SHELL_READY",
+    "P3:DESKTOP_USER:1000", "P3:RENDERER_ENV:pixman",
+    "P3:BACKENDS_ENV:libinput,drm", "P3:DRM_FD:card0",
+    "P3:DRM_MODESET_REQUESTED:Virtual-1", "P3:PIXMAN_RENDERER_CREATED",
+    "P3:SWAY_READY", "P3:LAYER_SHELL_READY",
     "P3:SHELL_READY",
 )
 
@@ -67,6 +90,14 @@ class BootResult:
     previous_nonce: str | None = None
     nonce: str | None = None
     window_id: str | None = None
+    second_window_id: str | None = None
+    second_opened: bool = False
+    minimized: bool = False
+    restored: bool = False
+    close_via_dock: bool = False
+    menu_targets: dict[str, list[int]] = field(default_factory=dict)
+    compact_target: list[int] | None = None
+    terminal_target: list[int] | None = None
     pointer_clicks: int = 0
     preference_toggled: bool = False
     keyboard_sent: bool = False
@@ -84,6 +115,27 @@ def exactly_once(items: list[str], value: str) -> int:
     if len(found) != 1:
         raise Phase3Failure(f"expected exactly one complete {value!r} marker")
     return found[0]
+
+def gtk_target_from_output(output: str, kind: str) -> tuple[int, int, int, int]:
+    """Validate actual mapped GtkWidget center and allocation in QMP pixels."""
+    if kind not in GTK_TARGET_RE:
+        raise ValueError("unknown GTK launcher widget")
+    prefix = "P3:" + kind + "_TARGET:"
+    tokens = lines(output)
+    raw = [item for item in tokens if item.startswith(prefix)]
+    matches = [(index, match) for index, item in enumerate(tokens)
+               if (match := GTK_TARGET_RE[kind].fullmatch(item))]
+    if len(raw) != 1 or len(matches) != 1:
+        raise Phase3Failure("missing/duplicated mapped GTK " + kind + " widget allocation")
+    x, y, width, height = (int(matches[0][1].group(n)) for n in range(1, 5))
+    if not (25 <= x <= 380 and 32 <= width <= 370 and 16 <= height <= 90
+            and 14 <= x - width // 2 and x + (width + 1) // 2 <= 394
+            and 43 <= y - height // 2 and y + (height + 1) // 2 <= 650):
+        raise Phase3Failure("GTK " + kind + " target is outside mapped launcher geometry")
+    if (kind == "TERMINAL" and not 85 <= y <= 360) or (
+            kind == "COMPACT" and not 240 <= y <= 610):
+        raise Phase3Failure("GTK " + kind + " target is in the wrong launcher row")
+    return x, y, width, height
 
 
 def identity(items: list[str], release: str, source: str) -> None:
@@ -121,23 +173,97 @@ def ready(output: str, release: str, source: str, previous: str | None) -> None:
         raise Phase3Failure("guest reported failure during positive startup")
 
 
-def poweroff(result: BootResult, expected_failure: str | None = None) -> int:
+def clean_shutdown(result: BootResult) -> int:
     if result.timed_out or result.output_limit or result.returncode != 0:
         raise Phase3Failure("guest timed out, flooded serial output or QEMU failed")
     if p2.KERNEL_FAILURE_RE.search(result.output):
         raise Phase3Failure("kernel panic/oops/error in guest serial log")
-    items = lines(result.output)
-    failures = [x for x in items if x.startswith(("P2:FAIL:", "P3:FAIL:"))]
-    if failures != ([expected_failure] if expected_failure else []):
-        raise Phase3Failure(f"unexpected guest failures: {failures!r}")
-    ends = [index for index, item in enumerate(items) if p2.POWER_DOWN_RE.fullmatch(item)]
+    ends = [index for index, item in enumerate(lines(result.output))
+            if p2.POWER_DOWN_RE.fullmatch(item)]
     if len(ends) != 1:
         raise Phase3Failure("missing unique kernel power-down proof")
     return ends[0]
 
 
+def poweroff(result: BootResult, expected_failure: str | None = None) -> int:
+    stop = clean_shutdown(result)
+    failures = [x for x in lines(result.output) if x.startswith(("P2:FAIL:", "P3:FAIL:"))]
+    if failures != ([expected_failure] if expected_failure else []):
+        raise Phase3Failure(f"unexpected guest failures: {failures!r}")
+    return stop
+
+
 def focus_ids(items: list[str]) -> list[str]:
     return [match.group(1) for item in items if (match := FOCUS_RE.fullmatch(item))]
+
+
+def ipc_states(items: list[str]) -> list[tuple[int, dict]]:
+    """Parse independently obtained real Sway get_tree snapshots from the guest.
+
+    A shell action marker alone is insufficient; every lifecycle transition
+    below is checked against the compositor's normalized JSON state, and the
+    real QMP frames provide separate host-side visual evidence.
+    """
+    observed = []
+    previous_seq = 0
+    for position, marker in enumerate(items):
+        if not marker.startswith(IPC_PREFIX):
+            continue
+        raw = marker[len(IPC_PREFIX):]
+        if len(raw) > 4096:
+            raise Phase3Failure("oversized Sway IPC state snapshot")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise Phase3Failure("invalid Sway IPC state JSON") from exc
+        if not isinstance(value, dict) or value.get("source") != "sway.get_tree":
+            raise Phase3Failure("IPC snapshot is not from a real Sway tree query")
+        sequence = value.get("seq")
+        windows = value.get("windows")
+        if type(sequence) is not int or sequence != previous_seq + 1:
+            raise Phase3Failure("Sway IPC sequence is missing or reordered")
+        if not isinstance(windows, list) or len(windows) > 32:
+            raise Phase3Failure("Sway IPC snapshot has invalid window count")
+        previous_seq = sequence
+        ids = set()
+        focused = 0
+        for node in windows:
+            if not isinstance(node, dict):
+                raise Phase3Failure("Sway IPC snapshot contains a malformed node")
+            con_id = node.get("id")
+            pid = node.get("pid")
+            app_id = node.get("app_id")
+            scratch = node.get("scratchpad_state")
+            visible = node.get("visible")
+            is_focused = node.get("focused")
+            minimized = node.get("minimized")
+            if (type(con_id) is not int or con_id <= 0 or con_id in ids or
+                    not isinstance(app_id, str) or len(app_id) > 128 or
+                    (pid is not None and (type(pid) is not int or pid <= 0)) or
+                    not isinstance(scratch, str) or len(scratch) > 32 or
+                    type(visible) is not bool or type(is_focused) is not bool or
+                    type(minimized) is not bool or
+                    minimized != (scratch != "none" and not visible)):
+                raise Phase3Failure("inconsistent Sway IPC leaf state")
+            ids.add(con_id)
+            focused += is_focused
+        if focused > 1:
+            raise Phase3Failure("multiple compositor leaf windows claim focus")
+        observed.append((position, value))
+    if not observed or observed[0][1]["seq"] != 1:
+        raise Phase3Failure("missing first real Sway IPC tree snapshot")
+    return observed
+
+
+def verified_window_state(
+    snapshots: list[tuple[int, dict]], before: int, con_id: int,
+) -> tuple[dict | None, dict]:
+    """Latest Sway snapshot at/before an observed transition marker."""
+    available = [value for position, value in snapshots if position < before]
+    if not available:
+        raise Phase3Failure("no Sway IPC tree evidence before lifecycle event")
+    tree = available[-1]
+    return next((item for item in tree["windows"] if item["id"] == con_id), None), tree
 
 
 def validate_positive(result: BootResult, release: str, source: str) -> None:
@@ -147,25 +273,124 @@ def validate_positive(result: BootResult, release: str, source: str) -> None:
         raise Phase3Failure("host challenge is absent")
     if result.nonce == result.previous_nonce:
         raise Phase3Failure("the second boot reused the first challenge")
-    expected_clicks = 5 if result.previous_nonce is None else 4
-    if not all((result.pointer_clicks == expected_clicks,
-                result.preference_toggled == (result.previous_nonce is None), result.keyboard_sent,
-                result.exit_sent, result.powerdown_sent)):
-        raise Phase3Failure("QMP did not perform preferences, Dock, keyboard, exit and shutdown")
+    expected_clicks = 9 if result.previous_nonce is None else 8
+    if not all((
+        result.pointer_clicks == expected_clicks,
+        result.preference_toggled == (result.previous_nonce is None),
+        result.keyboard_sent, result.exit_sent, result.powerdown_sent,
+        result.second_opened, result.minimized, result.restored,
+        result.close_via_dock, set(result.menu_targets) == {"Minimize", "Close"},
+    )):
+        raise Phase3Failure("QMP did not exercise launcher, two windows, Dock lifecycle and shutdown")
+    a, b = result.window_id, result.second_window_id
+    if (not isinstance(a, str) or not a.isdigit() or int(a) <= 0 or
+            not isinstance(b, str) or not b.isdigit() or int(b) <= 0 or a == b):
+        raise Phase3Failure("distinct live Sway foot IDs were not observed")
     items = lines(result.output)
+    opened = exactly_once(items, "P3:LAUNCHER_OPEN")
+    compact = gtk_target_from_output(result.output, "COMPACT")
+    terminal = gtk_target_from_output(result.output, "TERMINAL")
+    compact_mark = exactly_once(items, "P3:COMPACT_TARGET:" + ":".join(map(str, compact)))
+    terminal_mark = exactly_once(items, "P3:TERMINAL_TARGET:" + ":".join(map(str, terminal)))
+    launched = exactly_once(items, "P3:APP_LAUNCHED:foot")
+    if not (exactly_once(items, "P3:SHELL_READY") < opened < compact_mark < terminal_mark < launched):
+        raise Phase3Failure("actual mapped GTK launcher hitboxes were not observed before Terminal")
+    if (result.compact_target != list(compact) or
+            result.terminal_target != list(terminal) or
+            terminal[1] >= compact[1]):
+        raise Phase3Failure("QMP GTK hitbox coordinates disagree with real launcher geometry")
     if result.previous_nonce is None:
-        exactly_once(items, "P3:PREFERENCE_SAVED:compact_dock=true")
+        saved = exactly_once(items, "P3:PREFERENCE_SAVED:compact_dock=true")
+        if not terminal_mark < saved < launched:
+            raise Phase3Failure("real GTK Compact checkbox was not saved before launching Terminal")
     elif any(item.startswith("P3:PREFERENCE_SAVED:") for item in items):
         raise Phase3Failure("second boot unexpectedly rewrote the persisted preference")
     exactly_once(items, "P3:PREFERENCE_VERIFIED:compact_dock=true:uid=1000")
-    launched = exactly_once(items, "P3:APP_LAUNCHED:foot")
     keyboard = exactly_once(items, f"P3:KEYBOARD_OK:{result.nonce}")
-    focus = focus_ids(items)
-    if not focus or result.window_id != focus[0] or len(focus) < 2 or focus[1] != focus[0]:
-        raise Phase3Failure("Dock did not focus its observed Sway window twice")
-    closed = exactly_once(items, f"P3:WINDOW_CLOSED:{result.window_id}")
-    if not (exactly_once(items, "P3:SHELL_READY") < launched < keyboard < closed < stop):
-        raise Phase3Failure("window/keyboard/shutdown lifecycle was out of order")
+    # The first GTK Launcher Terminal must really obtain Sway focus.
+    # The live harness waits for this marker, and the offline manifest must
+    # independently replay it rather than trusting the harness result flags.
+    first_focus = next((i for i, marker in enumerate(items)
+                        if marker == f"P3:WINDOW_FOCUSED:{a}" and
+                        launched < i < keyboard), None)
+    if first_focus is None:
+        raise Phase3Failure("initial launcher Terminal focus not observed")
+    discovered = [(i, match.group(1)) for i, marker in enumerate(items)
+                  if (match := DISCOVERED_RE.fullmatch(marker))]
+    if len(discovered) != 2 or {key for _, key in discovered} != {a, b}:
+        raise Phase3Failure("Sway did not independently discover exactly two live foot clients")
+    created_a = exactly_once(items, f"P3:WINDOW_DISCOVERED:{a}:foot")
+    created_b = exactly_once(items, f"P3:WINDOW_DISCOVERED:{b}:foot")
+    minimized = exactly_once(items, f"P3:WINDOW_MINIMIZED:{a}")
+    restored = exactly_once(items, f"P3:WINDOW_RESTORED:{a}")
+    closed_a = exactly_once(items, f"P3:WINDOW_CLOSED:{a}")
+    closed_b = exactly_once(items, f"P3:WINDOW_CLOSED:{b}")
+    # A Dock 'kill' is not complete merely because its Wayland surface
+    # disappeared. The guest must independently prove that the same PID
+    # (from its pre-close Sway get_tree) is absent or zombie in /proc.
+    exit_markers = [(i, text) for i, text in enumerate(items)
+                    if text.startswith("P3:PROCESS_EXITED:")]
+    exited = [(i, match) for i, text in exit_markers
+              if (match := re.fullmatch(
+                  rf"P3:PROCESS_EXITED:{re.escape(a)}:([1-9][0-9]*)", text))]
+    if len(exit_markers) != 1 or len(exited) != 1:
+        raise Phase3Failure("Dock Close lacks unique real A process-exit proof")
+    process_exited, exited_match = exited[0]
+    activated = [(i, match.group(1)) for i, marker in enumerate(items)
+                 if (match := ACTIVATED_RE.fullmatch(marker))]
+    b_focus = next((i for i, cid in activated if cid == b and i >= created_b), None)
+    dock_focus = next((i for i, cid in enumerate(items)
+                       if cid == f"P3:WINDOW_FOCUSED:{a}" and
+                       b_focus is not None and i > b_focus), None)
+    restored_focus = next((i for i, cid in activated
+                           if cid == a and i > restored), None)
+    b_after_hide = next((i for i, cid in activated
+                         if cid == b and i > minimized), None)
+    b_after_close = next((i for i, cid in activated
+                          if cid == b and i > closed_a), None)
+    if (b_focus is None or dock_focus is None or restored_focus is None or
+            b_after_hide is None or b_after_close is None):
+        raise Phase3Failure("two-window Sway focus switching and restore were not proven")
+    if not (exactly_once(items, "P3:SHELL_READY") < created_a <= launched <
+            first_focus < keyboard < created_b <= b_focus < dock_focus < minimized <
+            b_after_hide < restored < restored_focus < closed_a <
+            process_exited < closed_b < stop and closed_a < b_after_close < closed_b):
+        raise Phase3Failure("real terminal/Dock/scratchpad lifecycle was out of order")
+    snapshots = ipc_states(items)
+    preclose, _ = verified_window_state(snapshots, closed_a, int(a))
+    observed_pids = {
+        node["pid"] for position, tree in snapshots if position < closed_a
+        for node in tree["windows"] if node["id"] == int(a)
+    }
+    if preclose is not None or observed_pids != {int(exited_match.group(1))}:
+        raise Phase3Failure("process-exit PID differs from the real Sway foot process")
+    for position, con_id, present, state in (
+        (created_a, a, True, None), (first_focus, a, True, "focused"),
+        (b_focus, b, True, "focused"),
+        (dock_focus, a, True, "focused"),
+        (minimized, a, True, "minimized"),
+        (b_after_hide, b, True, "focused"),
+        (restored, a, True, "restored"),
+        (restored_focus, a, True, "focused"),
+        (closed_a, a, False, None),
+        (b_after_close, b, True, "focused"), (closed_b, b, False, None),
+    ):
+        node, tree = verified_window_state(snapshots, position, int(con_id))
+        if present != (node is not None):
+            raise Phase3Failure("Sway IPC tree contradicts window lifecycle marker")
+        if node is not None and (
+            "foot" not in node["app_id"].casefold() or
+            type(node["pid"]) is not int or node["pid"] <= 0 or
+            (state == "focused" and not node["focused"]) or
+            (state == "minimized" and not node["minimized"]) or
+            (state == "restored" and node["minimized"])
+        ):
+            raise Phase3Failure("Sway IPC tree does not show the asserted real foot state")
+        if position in (b_focus, dock_focus, minimized, b_after_hide,
+                        restored, closed_a, b_after_close):
+            ids = {item["id"] for item in tree["windows"]}
+            if int(b) not in ids or (position < closed_a and int(a) not in ids):
+                raise Phase3Failure("both real terminal clients were not live during Dock switch")
     if len(result.screenshots) != len(SCREEN_STAGES) or set(result.screenshots) != set(SCREEN_STAGES):
         raise Phase3Failure("real graphical stages are missing")
     hashes = set()
@@ -177,9 +402,8 @@ def validate_positive(result: BootResult, release: str, source: str) -> None:
             if not re.fullmatch(r"[0-9a-f]{64}", str(proof.get(key, ""))):
                 raise Phase3Failure("invalid screenshot hash")
         hashes.add(proof["sha256"])
-    if len(hashes) != len(SCREEN_STAGES):
-        raise Phase3Failure("identical stage captures are not proof of UI interactions")
-
+    if len(hashes) < 8:
+        raise Phase3Failure("QMP snapshots lack distinct genuine application states")
 
 def validate_negative(result: BootResult, release: str, source: str) -> None:
     # Phase3 intentionally retains the Phase2 boot-check service. Its real
@@ -194,12 +418,71 @@ def validate_negative(result: BootResult, release: str, source: str) -> None:
     if not any(re.match(r"(?:\[[\d .]+\]\s*)?Linux version " + re.escape(release) + r"\s", line)
                for line in items):
         raise Phase3Failure("negative boot did not run the expected kernel")
-    forbidden = ("P3:DRM_OK", "P3:SWAY_READY", "P3:LAYER_SHELL_READY", "P3:SHELL_READY",
-                 "P3:APP_LAUNCHED", "P3:WINDOW_FOCUSED", "P3:KEYBOARD_OK", "P3:WINDOW_CLOSED")
+    forbidden = ("P3:DRM_OK", "P3:RENDERER_ENV:", "P3:PIXMAN_RENDERER_CREATED",
+                 "P3:BACKENDS_ENV:", "P3:DRM_FD:", "P3:DRM_MODESET_REQUESTED:",
+                 "P3:SWAY_READY", "P3:LAYER_SHELL_READY", "P3:SHELL_READY",
+                 "P3:LAUNCHER_OPEN", "P3:COMPACT_TARGET:", "P3:TERMINAL_TARGET:",
+                 "P3:APP_LAUNCHED", "P3:WINDOW_", "P3:IPC_TREE:", "P3:PROCESS_EXITED:", "P3:KEYBOARD_OK")
     if any(x.startswith(forbidden) for x in items):
         raise Phase3Failure("negative case reached a desktop or used a fallback renderer")
-    if result.nonce or result.keyboard_sent or result.pointer_clicks or result.screenshots:
+    if (result.nonce or result.keyboard_sent or result.pointer_clicks or
+            result.screenshots or result.second_window_id or result.second_opened or
+            result.minimized or result.restored or result.close_via_dock or
+            result.menu_targets or result.compact_target is not None or
+            result.terminal_target is not None):
         raise Phase3Failure("negative case unexpectedly performed graphical acceptance")
+
+
+def validate_shell_negative(result: BootResult, release: str, source: str) -> None:
+    """Genuine Sway/DRM startup followed by a test-gated real GTK child crash."""
+    stop = clean_shutdown(result)
+    items = lines(result.output)
+    identity(items, release, source)
+    ordered = (
+        f"P2:SOURCE:{source}", f"P2:KERNEL:{release}",
+        "P2:USERSPACE:debian", "P2:ROOT_OK",
+        f"P3:SOURCE:{source}", f"P3:KERNEL:{release}",
+        "P3:USERSPACE:debian", "P3:ROOT_OK", "P3:DRM_OK",
+        "P3:PERSISTED:EMPTY", "P3:PREFERENCE_DISK:compact_dock=absent",
+        "P3:DESKTOP_USER:1000", "P3:RENDERER_ENV:pixman",
+        "P3:BACKENDS_ENV:libinput,drm", "P3:DRM_FD:card0",
+        "P3:DRM_MODESET_REQUESTED:Virtual-1", "P3:PIXMAN_RENDERER_CREATED",
+        "P3:SWAY_READY",
+        "P3:INJECTED:SHELL_FAIL", "P3:FAIL:SHELL_EXIT",
+    )
+    positions = [exactly_once(items, marker) for marker in ordered]
+    # phase3-log.service forwards the session file asynchronously, while the
+    # inherited Phase 2 OnFailure service writes straight to ttyS0. Their
+    # serial order is NOT a reliable inter-service happens-before relation.
+    p2_failure = exactly_once(items, "P2:FAIL:DESKTOP_SERVICE")
+    if positions != sorted(positions) or stop <= max(positions[-1], p2_failure):
+        raise Phase3Failure("native Sway/GTK fault was not followed by clean shutdown")
+    # Depending on whether Gtk aborts or raises a Python exception, the real
+    # shell may also emit its own startup-failure marker before the supervisor.
+    child_failure = [i for i, item in enumerate(items) if item == "P3:FAIL:SHELL_STARTUP"]
+    if len(child_failure) > 1 or any(
+            not (positions[-2] < i < positions[-1]) for i in child_failure):
+        raise Phase3Failure("GTK child startup failure was duplicated or out of order")
+    failures = [item for item in items if item.startswith(("P2:FAIL:", "P3:FAIL:"))]
+    expected = (["P3:FAIL:SHELL_STARTUP"] if child_failure else []) + [
+        "P3:FAIL:SHELL_EXIT", "P2:FAIL:DESKTOP_SERVICE"]
+    if sorted(failures) != sorted(expected):
+        raise Phase3Failure(f"shell-negative had unexpected guest failures: {failures!r}")
+    forbidden = ("P3:LAYER_SHELL_READY", "P3:SHELL_READY",
+                 "P3:PREFERENCE_STATE:", "P3:PREFERENCE_SAVED:",
+                 "P3:LAUNCHER_OPEN", "P3:COMPACT_TARGET:", "P3:TERMINAL_TARGET:",
+                 "P3:APP_LAUNCHED:", "P3:WINDOW_", "P3:IPC_TREE:", "P3:PROCESS_EXITED:", "P3:KEYBOARD_OK:")
+    if any(item.startswith(forbidden) for item in items):
+        raise Phase3Failure("broken GTK child reported shell/UI success")
+    if any((result.previous_nonce is not None, result.nonce is not None,
+            result.window_id is not None, result.second_window_id is not None,
+            result.second_opened, result.minimized, result.restored,
+            result.close_via_dock, result.pointer_clicks != 0,
+            bool(result.menu_targets), result.compact_target is not None,
+            result.terminal_target is not None, result.preference_toggled,
+            result.keyboard_sent, result.exit_sent,
+            result.powerdown_sent, bool(result.screenshots))):
+        raise Phase3Failure("shell-negative attempted a positive GUI/HID/QMP flow")
 
 
 def changed_fraction(a: p2.Frame, b: p2.Frame, box=SCREEN_BOX) -> float:
@@ -218,6 +501,35 @@ def changed_fraction(a: p2.Frame, b: p2.Frame, box=SCREEN_BOX) -> float:
     return different / count
 
 
+def prove_compact_dock_visible(regular: p2.Frame, compact: p2.Frame) -> tuple[float, int, int]:
+    """Cross-boot GPU proof of a smaller real pinned Terminal icon.
+
+    Compare both initial ready frames, before any host action. The ROI excludes
+    the clock and launcher; the Dock outer window has a fixed 88px default size,
+    so only icon-content shrinkage (GTK DND 32 -> BUTTON 16) is asserted.
+    """
+    if (regular.width, regular.height, compact.width, compact.height) != (1024, 768, 1024, 768):
+        raise Phase3Failure("compact Dock frames have incompatible GPU dimensions")
+    delta = changed_fraction(regular, compact, box=DOCK_ICON_BOX)
+    def bright_pixels(frame: p2.Frame) -> int:
+        x1, y1, x2, y2 = DOCK_ICON_BOX
+        bright = 0
+        for y in range(y1, y2):
+            for x in range(x1, x2):
+                index = (y * frame.width + x) * 3
+                r, g, b = frame.pixels[index:index + 3]
+                bright += r >= 150 and g >= 160 and b >= 170
+        return bright
+    regular_bright = bright_pixels(regular)
+    compact_bright = bright_pixels(compact)
+    if delta < .025 or regular_bright < compact_bright + 20:
+        raise Phase3Failure(
+            "saved Compact Dock did not visibly shrink the real GPU icon "
+            f"(ROI change={delta:.4f}, bright pixels={regular_bright}/{compact_bright})"
+        )
+    return delta, regular_bright, compact_bright
+
+
 def verify_frame(frame: p2.Frame, stage: str) -> None:
     if (frame.width, frame.height) != (1024, 768):
         raise Phase3Failure("expected native 1024x768 QEMU GPU framebuffer")
@@ -234,12 +546,125 @@ def verify_frame(frame: p2.Frame, stage: str) -> None:
         raise Phase3Failure(f"{stage} framebuffer does not show detailed topbar and Dock regions")
 
 
-def click(qmp: p2.QMP, x=DOCK_X, y=DOCK_Y) -> None:
+def click(qmp: p2.QMP, x=DOCK_X, y=DOCK_Y, *, button: str = "left") -> None:
+    """Real QMP tablet pointer+button interaction; no guest-side UI bypass."""
+    if button not in ("left", "right"):
+        raise ValueError("unsupported emulated pointer button")
     qmp.execute("input-send-event", {"events": p2.pointer_events(x, y)})
     time.sleep(.1)
     for down in (True, False):
-        qmp.execute("input-send-event", {"events": [{"type": "btn", "data": {"down": down, "button": "left"}}]})
+        qmp.execute("input-send-event", {"events": [
+            {"type": "btn", "data": {"down": down, "button": button}},
+        ]})
         time.sleep(.06)
+
+
+def key_event(qmp: p2.QMP, key: str, down: bool) -> None:
+    qmp.execute("input-send-event", {"events": [{"type": "key", "data": {
+        "down": down, "key": {"type": "qcode", "data": key},
+    }}]})
+    time.sleep(.035)
+
+
+def press_key(qmp: p2.QMP, key: str) -> None:
+    key_event(qmp, key, True)
+    key_event(qmp, key, False)
+
+
+def press_chord(qmp: p2.QMP, *keys: str) -> None:
+    """Send a real Sway Mod4+Return binding through emulated keyboard input."""
+    if tuple(keys) != ("meta_l", "ret"):
+        raise ValueError("unsupported acceptance keyboard chord")
+    for key in keys:
+        key_event(qmp, key, True)
+    for key in reversed(keys):
+        key_event(qmp, key, False)
+
+
+def popup_menu_target(before: p2.Frame, popup: p2.Frame,
+                      operation: str) -> tuple[int, int]:
+    """Derive the real GTK menu row from actual QEMU framebuffer pixels.
+
+    The Dock keeps KeyboardMode.NONE, so focus cannot be stolen from foot.
+    CSS paints the GTK menu body #1a2a40 and 1px border #7598b4.
+    We select exactly one plausible changed, color-matched rectangle in the
+    bottom-center GPU scanout. Unknown dimensions/theme fail closed; a tested
+    image of the first real VM popup is needed before release.
+    """
+    if operation not in ("Minimize", "Close"):
+        raise ValueError("unsupported Dock context operation")
+    if (before.width, before.height) != (1024, 768) or (
+            popup.width, popup.height) != (1024, 768):
+        raise Phase3Failure("popup calibration requires native QEMU GPU frames")
+    # GTK colors are CSS literals, not invented pixel coordinates. Bounds
+    # include cursor at (512,730) and permit Wayland popup placement/flipping.
+    body, border = (26, 42, 64), (117, 152, 180)
+    x1, y1, x2, y2 = (330, 440, 820, 755)
+    pixels: set[tuple[int, int]] = set()
+    border_pixels: set[tuple[int, int]] = set()
+    for y in range(y1, y2):
+        for x in range(x1, x2):
+            offset = (y * 1024 + x) * 3
+            old = before.pixels[offset:offset + 3]
+            new = popup.pixels[offset:offset + 3]
+            # Popup #1a2a40 differs from wallpaper #152437 by only 5/6/9;
+            # a 13-level cutoff incorrectly discards genuine CSS menu interiors.
+            if max(abs(old[k] - new[k]) for k in range(3)) < 5:
+                continue
+            on_body = max(abs(new[k] - body[k]) for k in range(3)) <= 15
+            on_border = max(abs(new[k] - border[k]) for k in range(3)) <= 24
+            if on_body or on_border:
+                pixels.add((x, y))
+                if on_border:
+                    border_pixels.add((x, y))
+    # Flood-fill the CSS-colored changed region; Dock hover is too short to
+    # qualify as a three-row popup, and disconnected fragments are rejected.
+    remaining = set(pixels)
+    candidates: list[tuple[int, int, int, int]] = []
+    while remaining:
+        seed = remaining.pop()
+        stack = [seed]
+        min_x = max_x = seed[0]
+        min_y = max_y = seed[1]
+        count = 0
+        border_count = 0
+        while stack:
+            x, y = stack.pop()
+            count += 1
+            border_count += (x, y) in border_pixels
+            min_x, max_x = min(min_x, x), max(max_x, x)
+            min_y, max_y = min(min_y, y), max(max_y, y)
+            for neighbor in ((x-1, y), (x+1, y), (x, y-1),
+                             (x, y+1), (x-1, y-1), (x+1, y-1),
+                             (x-1, y+1), (x+1, y+1)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+        width, height = max_x - min_x + 1, max_y - min_y + 1
+        if (96 <= width <= 310 and 66 <= height <= 194 and
+                400 <= min_x <= 680 and 510 <= min_y < max_y <= 740 and
+                min_x < DOCK_X + 90 and max_x > DOCK_X - 90 and
+                # Require a substantial solid menu body, not only a thin
+                # border or the Dock hover repaint behind the popup.
+                count >= width * height // 3 and border_count >= 35):
+            candidates.append((min_x, min_y, max_x, max_y))
+    if len(candidates) != 1:
+        raise Phase3Failure("real GTK menu rectangle ambiguous or not visible")
+    x1, y1, x2, y2 = candidates[0]
+    row = 1 if operation == "Minimize" else 2
+    x = (x1 + x2) // 2
+    y = round(y1 + (row + .5) * (y2 - y1 + 1) / 3)
+    if not (x1 + 12 <= x <= x2 - 12 and y1 + 10 <= y <= y2 - 8):
+        raise Phase3Failure("calibrated QMP menu click falls outside GTK row")
+    return x, y
+
+
+def click_dock_context_menu(qmp: p2.QMP, before: p2.Frame,
+                            popup: p2.Frame, operation: str) -> tuple[int, int]:
+    """Physically click the selected menu item with QMP tablet HID."""
+    target = popup_menu_target(before, popup, operation)
+    click(qmp, *target)
+    return target
 
 
 def text_keys(value: str) -> list[str]:
@@ -250,22 +675,34 @@ def text_keys(value: str) -> list[str]:
 
 def enter_text(qmp: p2.QMP, value: str) -> None:
     for key in text_keys(value):
-        for down in (True, False):
-            qmp.execute("input-send-event", {"events": [{"type": "key", "data": {
-                "down": down, "key": {"type": "qcode", "data": key},
-            }}]})
-            time.sleep(.025)
-
+        press_key(qmp, key)
 
 class Phase3Monitor(p2.SerialMonitor):
     def check(self, *, require_running=True):
         super().check(require_running=require_running)
         failures = [line for line in lines(self.output()) if line.startswith(("P2:FAIL:", "P3:FAIL:"))]
-        if any(value != self.expected_failure for value in failures):
+        allowed = {self.expected_failure} if self.expected_failure else set()
+        if self.expected_failure == "P2:FAIL:DESKTOP_SERVICE":
+            allowed.update(("P3:FAIL:SHELL_STARTUP", "P3:FAIL:SHELL_EXIT"))
+        if any(value not in allowed for value in failures):
             raise Phase3Failure(f"unexpected guest failure: {failures!r}")
 
 
-def capture(qmp: p2.QMP, name: str, stage: str, deadline: float) -> tuple[dict, p2.Frame]:
+def capture(qmp: p2.QMP, name: str, stage: str, deadline: float, *,
+            changed_from: p2.Frame | None = None, box=SCREEN_BOX,
+            min_changed: float = 0.0,
+            popup_operation: str | None = None) -> tuple[dict, p2.Frame]:
+    """Capture real QMP scanout; retry until UI transition is actually visible.
+
+    Gtk Wayland popup mapping and Sway focus/modeset rendering are asynchronous
+    to serial IPC markers. For Dock popups, a changed hover pixel is not
+    enough: the *same actual framebuffer* must contain one uniquely calibrated
+    three-row GTK menu before the screenshot is accepted. Every screendump
+    retry remains in the QMP JSONL transcript with a successful QMP reply;
+    only the final accepted framebuffer is hashed into the evidence manifest.
+    """
+    if popup_operation is not None and changed_from is None:
+        raise ValueError("GTK popup calibration needs its preceding QEMU frame")
     path = OUT / "screenshots" / f"{name}-{stage}.ppm"
     png = path.with_suffix(".png")
     p2.safe_file(path, must_exist=False)
@@ -278,6 +715,13 @@ def capture(qmp: p2.QMP, name: str, stage: str, deadline: float) -> tuple[dict, 
         try:
             frame = p2.parse_ppm(path.read_bytes())
             verify_frame(frame, stage)
+            if changed_from is not None and (
+                    changed_fraction(changed_from, frame, box=box) < min_changed):
+                raise Phase3Failure("QMP GPU pixels have not changed for " + stage)
+            if popup_operation is not None:
+                # GTK may draw Dock hover long before its xdg_popup appears.
+                # Retry real screendumps until the actual CSS menu is mapped.
+                popup_menu_target(changed_from, frame, popup_operation)
         except (p2.SmokeFailure, Phase3Failure) as error:
             last_error = str(error)
             time.sleep(.2)
@@ -289,10 +733,12 @@ def capture(qmp: p2.QMP, name: str, stage: str, deadline: float) -> tuple[dict, 
                  "width": frame.width, "height": frame.height}, frame)
     raise Phase3Failure(f"QEMU {stage} screendump not valid: {last_error}")
 
-
 def transcript(records: str, nonce: str | None, screenshots: dict, *,
-               preference_toggled: bool = False) -> None:
-    """Require successful QMP acknowledgements in the exact real-HID sequence."""
+               preference_toggled: bool = False,
+               menu_targets: dict | None = None,
+               compact_target: list[int] | None = None,
+               terminal_target: list[int] | None = None) -> None:
+    """Require acknowledgments for every QMP framebuffer, HID and power action."""
     try:
         events = [json.loads(line) for line in records.splitlines() if line.strip()]
     except json.JSONDecodeError as error:
@@ -300,9 +746,30 @@ def transcript(records: str, nonce: str | None, screenshots: dict, *,
     if not isinstance(events, list) or len(events) > 10000:
         raise Phase3Failure("unbounded or invalid QMP transcript")
     if nonce is None:
-        if events or screenshots:
+        if (events or screenshots or menu_targets or compact_target is not None or
+                terminal_target is not None):
             raise Phase3Failure("negative test used graphical QMP events")
         return
+    if (not isinstance(menu_targets, dict) or
+            set(menu_targets) != {"Minimize", "Close"} or
+            any(not isinstance(target, list) or len(target) != 2 or
+                type(target[0]) is not int or not 0 <= target[0] < 1024 or
+                type(target[1]) is not int or not 0 <= target[1] < 768
+                for target in menu_targets.values())):
+        raise Phase3Failure("unbound/invalid GPU-calibrated Dock click targets")
+    for kind, target in (("COMPACT", compact_target), ("TERMINAL", terminal_target)):
+        if (not isinstance(target, list) or len(target) != 4 or
+                any(type(value) is not int for value in target)):
+            raise Phase3Failure("unbound/invalid real GTK " + kind + " allocation")
+        x, y, width, height = target
+        if (not (25 <= x <= 380 and 32 <= width <= 370 and 16 <= height <= 90
+                 and 14 <= x - width // 2 and x + (width + 1) // 2 <= 394
+                 and 43 <= y - height // 2 and y + (height + 1) // 2 <= 650)
+                or (kind == "TERMINAL" and not 85 <= y <= 360)
+                or (kind == "COMPACT" and not 240 <= y <= 610)):
+            raise Phase3Failure("real GTK " + kind + " hitbox is off-screen/implausible")
+    if terminal_target[1] >= compact_target[1]:
+        raise Phase3Failure("GTK Terminal row must be above Compact checkbox")
     requests = []
     pending = None
     greeted = False
@@ -322,8 +789,6 @@ def transcript(records: str, nonce: str | None, screenshots: dict, *,
             elif "event" in msg and greeted:
                 if any(field in msg for field in ("id", "return", "error")):
                     raise Phase3Failure("malformed asynchronous QMP event")
-                # Events can legitimately arrive before, during or after
-                # command acknowledgements; never mistake them for replies.
                 continue
             elif pending is not None and msg.get("id") == pending["id"] and "return" in msg and "error" not in msg:
                 requests.append(pending)
@@ -337,50 +802,83 @@ def transcript(records: str, nonce: str | None, screenshots: dict, *,
     position = 0
     def expect(name: str, args: dict | None = None) -> None:
         nonlocal position
-        if position >= len(requests) or requests[position].get("execute") != name or requests[position].get("arguments", {}) != (args or {}):
+        if (position >= len(requests) or requests[position].get("execute") != name or
+                requests[position].get("arguments", {}) != (args or {})):
             raise Phase3Failure(f"QMP transcript missing expected {name} at action {position}")
         position += 1
     def screenshot(stage: str) -> None:
         nonlocal position
         p = OUT / screenshots[stage]["path"]
         seen = 0
-        while position < len(requests) and requests[position].get("execute") == "screendump":
-            if requests[position].get("arguments") != {"filename": str(p)}:
-                raise Phase3Failure("QMP captured an unexpected screenshot path")
+        # Distinguish same-stage async retries from consecutive *different*
+        # screenshot stages (launcher then preferences on second boot has no
+        # intervening pointer input). The next path belongs to the next stage.
+        while (position < len(requests) and
+               requests[position].get("execute") == "screendump" and
+               requests[position].get("arguments") == {"filename": str(p)}):
             seen += 1
             position += 1
         if not seen:
             raise Phase3Failure(f"missing real QMP {stage} screendump")
-    def clicked(x: int, y: int) -> None:
+    def clicked(x: int, y: int, button="left") -> None:
         expect("input-send-event", {"events": p2.pointer_events(x, y)})
         for down in (True, False):
-            expect("input-send-event", {"events": [{"type": "btn", "data": {"down": down, "button": "left"}}]})
+            expect("input-send-event", {"events": [
+                {"type": "btn", "data": {"down": down, "button": button}},
+            ]})
+    def pressed(key: str) -> None:
+        for down in (True, False):
+            expect("input-send-event", {"events": [{"type": "key", "data": {
+                "down": down, "key": {"type": "qcode", "data": key},
+            }}]})
+    def chord(*keys: str) -> None:
+        for key in keys:
+            expect("input-send-event", {"events": [{"type": "key", "data": {
+                "down": True, "key": {"type": "qcode", "data": key},
+            }}]})
+        for key in reversed(keys):
+            expect("input-send-event", {"events": [{"type": "key", "data": {
+                "down": False, "key": {"type": "qcode", "data": key},
+            }}]})
     def typed(value: str) -> None:
         for key in text_keys(value):
-            for down in (True, False):
-                expect("input-send-event", {"events": [{"type": "key", "data": {
-                    "down": down, "key": {"type": "qcode", "data": key}}}]})
+            pressed(key)
+    def menu(operation: str) -> None:
+        target = menu_targets[operation]
+        clicked(*target)
     expect("qmp_capabilities")
     screenshot("ready")
     clicked(MENU_X, MENU_Y)
+    screenshot("launcher")
     if preference_toggled:
-        clicked(COMPACT_X, COMPACT_Y)
+        clicked(*compact_target[:2])
     screenshot("preferences")
-    clicked(MENU_X, MENU_Y)
-    clicked(DOCK_X, DOCK_Y)
+    clicked(*terminal_target[:2])
     screenshot("foot")
     typed("p3save " + nonce)
     screenshot("saved")
+    chord("meta_l", "ret")
+    screenshot("second")
     clicked(DOCK_X, DOCK_Y)
+    screenshot("focused")
+    clicked(DOCK_X, DOCK_Y, "right")
+    screenshot("menu_minimize")
+    menu("Minimize")
+    screenshot("hidden")
+    clicked(DOCK_X, DOCK_Y)
+    screenshot("restored")
+    clicked(DOCK_X, DOCK_Y, "right")
+    screenshot("menu_close")
+    menu("Close")
+    screenshot("closed")
     typed("exit")
     screenshot("desktop")
     expect("system_powerdown")
     if position != len(requests):
         raise Phase3Failure("QMP transcript includes unexpected extra commands")
 
-
 def make_overlay(name: str) -> None:
-    if name not in ("test", "negative"):
+    if name not in ("test", "negative", "shell-negative"):
         raise ValueError("only dedicated test overlays may be recreated")
     path = OUT / f"{name}.qcow2"
     p2.safe_file(path, must_exist=False)
@@ -393,16 +891,21 @@ def make_overlay(name: str) -> None:
 
 def boot(name: str, timeout: float, release: str, source: str,
          previous: str | None = None) -> tuple[BootResult, dict]:
+    if name not in ("round1", "round2", "negative", "shell-negative"):
+        raise ValueError("unknown Phase3 QEMU acceptance scenario")
     negative = name == "negative"
-    disk = OUT / ("negative.qcow2" if negative else "test.qcow2")
+    shell_negative = name == "shell-negative"
+    mode = "negative" if negative else ("shell-negative" if shell_negative else "test")
+    disk = OUT / ("negative.qcow2" if negative else
+                  ("shell-negative.qcow2" if shell_negative else "test.qcow2"))
     command = ["bash", str(PHASE / "scripts" / "boot-qemu.sh"), "--mode",
-               "negative" if negative else "test", "--name", name, "--disk", str(disk)]
+               mode, "--name", name, "--disk", str(disk)]
     serial = OUT / "logs" / f"boot-{name}.log"
     qmp_path = OUT / "logs" / f"qmp-{name}.jsonl"
     started = time.monotonic()
     deadline = started + timeout
     result = BootResult(name=name, previous_nonce=previous)
-    record = {"name": name, "status": "fail", "command": command,
+    record = {"name": name, "mode": mode, "status": "fail", "command": command,
               "serial_log": str(serial.relative_to(OUT)), "qmp_log": str(qmp_path.relative_to(OUT))}
     process = monitor = client = None
     try:
@@ -411,59 +914,221 @@ def boot(name: str, timeout: float, release: str, source: str,
         qmp_path.write_text("", encoding="utf-8")
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True)
-        monitor = Phase3Monitor(process, serial, deadline, "P2:FAIL:NO_DRM" if negative else None)
+        expected_failure = ("P2:FAIL:NO_DRM" if negative else
+                            ("P2:FAIL:DESKTOP_SERVICE" if shell_negative else None))
+        monitor = Phase3Monitor(process, serial, deadline, expected_failure)
         if negative:
             monitor.wait_marker("P2:FAIL:NO_DRM")
+        elif shell_negative:
+            monitor.wait_marker("P3:SWAY_READY")
+            monitor.wait_marker("P3:INJECTED:SHELL_FAIL")
+            monitor.wait_marker("P3:FAIL:SHELL_EXIT")
+            monitor.wait_marker("P2:FAIL:DESKTOP_SERVICE")
         else:
             client = p2.QMP(OUT / f"qmp-{name}.sock", qmp_path, deadline, monitor.check)
             monitor.wait_marker("P3:SHELL_READY")
-            # The shell publishes preference state after mapping through the
-            # compositor; serial log forwarding can lag the readiness marker.
+            # A mapped GTK layer surface and a genuine compositor IPC snapshot
+            # must exist before any host-supplied challenge or pointer action.
             monitor.wait_marker(f"P3:PREFERENCE_STATE:compact_dock={'true' if previous else 'false'}")
             ready(monitor.output(), release, source, previous)
             result.screenshots["ready"], first = capture(client, name, "ready", deadline)
-            # The random challenge is not provided to the guest until after
-            # a real, non-blank native framebuffer has been observed.
+            print(f"phase3: {name}: native ready GPU framebuffer captured", flush=True)
+            # The challenge is created after the real QMP framebuffer proves
+            # a detailed 1024x768 GPU output, never injected via serial/fw_cfg.
             result.nonce = secrets.token_hex(16)
             while result.nonce == previous:
                 result.nonce = secrets.token_hex(16)
+
+            def wait_observed(predicate, description: str) -> None:
+                while not predicate(lines(monitor.output())):
+                    monitor.check()
+                    if time.monotonic() >= deadline:
+                        raise Phase3Failure("timed out waiting for " + description)
+                    time.sleep(.05)
+
             click(client, MENU_X, MENU_Y)
             result.pointer_clicks += 1
+            monitor.wait_marker("P3:LAUNCHER_OPEN")
+            # A GTK show/allocation marker alone does not prove compositor
+            # mapping. Accept the real 13th QMP frame only after the top-left
+            # launcher *actually changed* scanout pixels, before any settings click.
+            result.screenshots["launcher"], launcher = capture(
+                client, name, "launcher", deadline, changed_from=first,
+                box=LAUNCHER_BOX, min_changed=.015)
+            print(f"phase3: {name}: real GTK launcher scanout visible", flush=True)
+            wait_observed(lambda items: any(GTK_TARGET_RE["COMPACT"].fullmatch(m) for m in items),
+                          "real mapped GTK Compact checkbox geometry")
+            wait_observed(lambda items: any(GTK_TARGET_RE["TERMINAL"].fullmatch(m) for m in items),
+                          "real mapped GTK Terminal row geometry")
+            result.compact_target = list(gtk_target_from_output(monitor.output(), "COMPACT"))
+            result.terminal_target = list(gtk_target_from_output(monitor.output(), "TERMINAL"))
+            if result.terminal_target[1] >= result.compact_target[1]:
+                raise Phase3Failure("GTK Terminal row is not above Compact checkbox")
+            print(f"phase3: {name}: two mapped GTK widget hitboxes verified", flush=True)
             if previous is None:
-                click(client, COMPACT_X, COMPACT_Y)
+                click(client, *result.compact_target[:2])
                 result.pointer_clicks += 1
                 result.preference_toggled = True
                 monitor.wait_marker("P3:PREFERENCE_SAVED:compact_dock=true")
-            result.screenshots["preferences"], preferences = capture(client, name, "preferences", deadline)
-            if changed_fraction(first, preferences) < .025:
-                raise Phase3Failure("Applications/preferences view did not open visibly")
-            click(client, MENU_X, MENU_Y)
-            result.pointer_clicks += 1
-            click(client)
+                print(f"phase3: {name}: Compact preference saved by genuine Gtk.CheckButton", flush=True)
+                result.screenshots["preferences"], preferences = capture(
+                    client, name, "preferences", deadline, changed_from=launcher,
+                    box=DOCK_ICON_BOX, min_changed=.025)
+                if changed_fraction(launcher, preferences, box=DOCK_ICON_BOX) < .025:
+                    raise Phase3Failure("GTK Compact checkbox did not change Dock GPU icon pixels")
+            else:
+                result.screenshots["preferences"], preferences = capture(
+                    client, name, "preferences", deadline, changed_from=first,
+                    box=LAUNCHER_BOX, min_changed=.015)
+                if changed_fraction(first, preferences, box=LAUNCHER_BOX) < .015:
+                    raise Phase3Failure("second-boot GTK launcher was not visible")
+
+            # Pointer must activate the actual GTK Terminal row in the mapped
+            # launcher, not guess coordinates or bypass it with host exec/swaymsg.
+            click(client, *result.terminal_target[:2])
             result.pointer_clicks += 1
             monitor.wait_marker("P3:APP_LAUNCHED:foot")
-            while not focus_ids(lines(monitor.output())):
-                monitor.check()
-                time.sleep(.05)
-            result.window_id = focus_ids(lines(monitor.output()))[0]
-            result.screenshots["foot"], opened = capture(client, name, "foot", deadline)
+            print(f"phase3: {name}: GTK Terminal row launched real foot", flush=True)
+            wait_observed(lambda items: len([m for m in items if DISCOVERED_RE.fullmatch(m)]) >= 1,
+                          "first Sway terminal")
+            result.window_id = next(DISCOVERED_RE.fullmatch(x).group(1)
+                                    for x in lines(monitor.output()) if DISCOVERED_RE.fullmatch(x))
+            monitor.wait_marker(f"P3:WINDOW_FOCUSED:{result.window_id}")
+            result.screenshots["foot"], opened = capture(
+                client, name, "foot", deadline, changed_from=first, min_changed=.07)
             if changed_fraction(first, opened) < .07:
-                raise Phase3Failure("native terminal did not materially change the framebuffer")
+                raise Phase3Failure("launcher Terminal did not change real framebuffer")
+
             enter_text(client, "p3save " + result.nonce)
             result.keyboard_sent = True
             monitor.wait_marker(f"P3:KEYBOARD_OK:{result.nonce}")
-            result.screenshots["saved"], _ = capture(client, name, "saved", deadline)
+            result.screenshots["saved"], saved_frame = capture(client, name, "saved", deadline)
+
+            # A second genuine terminal is launched by Sway's documented
+            # Mod4+Return keyboard binding, not by a guest test bypass.
+            press_chord(client, "meta_l", "ret")
+            wait_observed(lambda items: len([m for m in items if DISCOVERED_RE.fullmatch(m)]) >= 2,
+                          "second live foot container")
+            seen_ids = [match.group(1) for item in lines(monitor.output())
+                        if (match := DISCOVERED_RE.fullmatch(item))]
+            result.second_window_id = next(
+                (cid for cid in seen_ids if cid != result.window_id), None)
+            if not result.second_window_id:
+                raise Phase3Failure("second real foot process has no distinct Sway container")
+            monitor.wait_marker(f"P3:WINDOW_ACTIVATED:{result.second_window_id}")
+            result.second_opened = True
+            result.screenshots["second"], second = capture(
+                client, name, "second", deadline, changed_from=saved_frame,
+                box=FOOT_CONTENT_BOX, min_changed=.001)
+            if changed_fraction(saved_frame, second, box=FOOT_CONTENT_BOX) < .001:
+                raise Phase3Failure("second live terminal did not change the GPU framebuffer")
+
+            # Oldest foot is the pinned Dock target. While B is active, click
+            # that Dock icon to focus A; both IDs must stay live in Sway IPC.
             click(client)
             result.pointer_clicks += 1
-            while focus_ids(lines(monitor.output())).count(result.window_id) < 2:
-                monitor.check()
-                time.sleep(.05)
+            wait_observed(
+                lambda items: any(
+                    i > next((j for j, m in enumerate(items)
+                              if m == f"P3:WINDOW_ACTIVATED:{result.second_window_id}"), len(items))
+                    and m == f"P3:WINDOW_FOCUSED:{result.window_id}"
+                    for i, m in enumerate(items)),
+                "Dock focus switch from B to A",
+            )
+            result.screenshots["focused"], focused = capture(
+                client, name, "focused", deadline, changed_from=second,
+                box=FOOT_CONTENT_BOX, min_changed=.001)
+            if changed_fraction(second, focused, box=FOOT_CONTENT_BOX) < .001:
+                raise Phase3Failure("Dock focus switch did not alter actual GPU pixels")
+
+            # Real GTK Dock right-click menu (not a guessed Sway command).
+            # Calibrate the row from actual QEMU pixels, then click by tablet.
+            click(client, button="right")
+            result.pointer_clicks += 1
+            result.screenshots["menu_minimize"], menu_minimize = capture(
+                client, name, "menu_minimize", deadline, changed_from=focused,
+                box=MENU_POPUP_BOX, min_changed=.003, popup_operation="Minimize")
+            if changed_fraction(focused, menu_minimize, box=MENU_POPUP_BOX) < .003:
+                raise Phase3Failure("Dock Minimize context menu was not visible")
+            target = click_dock_context_menu(client, focused, menu_minimize, "Minimize")
+            result.menu_targets["Minimize"] = list(target)
+            result.pointer_clicks += 1
+            monitor.wait_marker(f"P3:WINDOW_MINIMIZED:{result.window_id}")
+            wait_observed(
+                lambda items: any(
+                    i > next((j for j, m in enumerate(items)
+                              if m == f"P3:WINDOW_MINIMIZED:{result.window_id}"), len(items))
+                    and m == f"P3:WINDOW_ACTIVATED:{result.second_window_id}"
+                    for i, m in enumerate(items)),
+                "surviving terminal B focus after scratchpad hide",
+            )
+            result.minimized = True
+            result.screenshots["hidden"], hidden = capture(
+                client, name, "hidden", deadline, changed_from=focused,
+                box=FOOT_CONTENT_BOX, min_changed=.001)
+            if changed_fraction(focused, hidden, box=FOOT_CONTENT_BOX) < .001:
+                raise Phase3Failure("scratchpad hide did not change the framebuffer")
+
+            click(client)
+            result.pointer_clicks += 1
+            monitor.wait_marker(f"P3:WINDOW_RESTORED:{result.window_id}")
+            wait_observed(
+                lambda items: any(
+                    i > next((j for j, m in enumerate(items)
+                              if m == f"P3:WINDOW_RESTORED:{result.window_id}"), len(items))
+                    and m == f"P3:WINDOW_ACTIVATED:{result.window_id}"
+                    for i, m in enumerate(items)),
+                "scratchpad restoration and focus",
+            )
+            result.restored = True
+            result.screenshots["restored"], restored = capture(
+                client, name, "restored", deadline, changed_from=hidden,
+                box=FOOT_CONTENT_BOX, min_changed=.001)
+            if changed_fraction(hidden, restored, box=FOOT_CONTENT_BOX) < .001:
+                raise Phase3Failure("scratchpad restore did not change the framebuffer")
+
+            click(client, button="right")
+            result.pointer_clicks += 1
+            result.screenshots["menu_close"], menu_close = capture(
+                client, name, "menu_close", deadline, changed_from=restored,
+                box=MENU_POPUP_BOX, min_changed=.003, popup_operation="Close")
+            if changed_fraction(restored, menu_close, box=MENU_POPUP_BOX) < .003:
+                raise Phase3Failure("Dock Close context menu was not visible")
+            target = click_dock_context_menu(client, restored, menu_close, "Close")
+            result.menu_targets["Close"] = list(target)
+            result.pointer_clicks += 1
+            monitor.wait_marker(f"P3:WINDOW_CLOSED:{result.window_id}")
+            wait_observed(
+                lambda items: any(re.fullmatch(
+                    rf"P3:PROCESS_EXITED:{re.escape(result.window_id)}:[1-9][0-9]*", marker)
+                    for marker in items),
+                "real Dock-closed foot PID exited /proc",
+            )
+            wait_observed(
+                lambda items: any(
+                    i > next((j for j, m in enumerate(items)
+                              if m == f"P3:WINDOW_CLOSED:{result.window_id}"), len(items))
+                    and m == f"P3:WINDOW_ACTIVATED:{result.second_window_id}"
+                    for i, m in enumerate(items)),
+                "surviving terminal B focus after Sway Dock kill",
+            )
+            result.close_via_dock = True
+            result.screenshots["closed"], closed = capture(
+                client, name, "closed", deadline, changed_from=restored,
+                box=FOOT_CONTENT_BOX, min_changed=.001)
+            if changed_fraction(restored, closed, box=FOOT_CONTENT_BOX) < .001:
+                raise Phase3Failure("Sway Dock kill did not remove its actual GPU window")
+
+            # After Sway closes A, surviving foot B is focused; close it via
+            # real terminal keyboard so the final desktop is visibly empty.
             enter_text(client, "exit")
             result.exit_sent = True
-            monitor.wait_marker(f"P3:WINDOW_CLOSED:{result.window_id}")
-            result.screenshots["desktop"], final = capture(client, name, "desktop", deadline)
-            if changed_fraction(opened, final) < .07:
-                raise Phase3Failure("foot window did not visually disappear after exit")
+            monitor.wait_marker(f"P3:WINDOW_CLOSED:{result.second_window_id}")
+            result.screenshots["desktop"], desktop = capture(
+                client, name, "desktop", deadline, changed_from=closed,
+                min_changed=.07)
+            if changed_fraction(closed, desktop) < .07:
+                raise Phase3Failure("second foot did not visibly exit")
             client.execute("system_powerdown")
             result.powerdown_sent = True
         monitor.wait_exit()
@@ -471,10 +1136,26 @@ def boot(name: str, timeout: float, release: str, source: str,
         result.returncode = process.returncode
         if negative:
             validate_negative(result, release, source)
+        elif shell_negative:
+            validate_shell_negative(result, release, source)
         else:
             validate_positive(result, release, source)
         transcript(qmp_path.read_text(encoding="utf-8"), result.nonce, result.screenshots,
-                   preference_toggled=result.preference_toggled)
+                   preference_toggled=result.preference_toggled,
+                   menu_targets=result.menu_targets,
+                   compact_target=result.compact_target,
+                   terminal_target=result.terminal_target)
+        if name == "round2":
+            # The first boot saved Compact Dock on disk; the second must show
+            # an actually smaller GTK icon in the independent GPU scanout.
+            regular_path = OUT / "screenshots" / "round1-ready.ppm"
+            compact_path = OUT / "screenshots" / "round2-ready.ppm"
+            p2.safe_file(regular_path)
+            p2.safe_file(compact_path)
+            regular_frame = p2.parse_ppm(regular_path.read_bytes())
+            compact_frame = p2.parse_ppm(compact_path.read_bytes())
+            delta, before, after = prove_compact_dock_visible(regular_frame, compact_frame)
+            print(f"phase3: real Compact Dock GPU proof: change={delta:.4f}, icon pixels {before}->{after}", flush=True)
         record["status"] = "pass"
     except (Phase3Failure, p2.SmokeFailure, OSError, subprocess.SubprocessError, ValueError) as error:
         record["error"] = str(error)
@@ -493,7 +1174,13 @@ def boot(name: str, timeout: float, release: str, source: str,
         record.update({"returncode": result.returncode, "duration_seconds": result.duration_seconds,
                        "timed_out": result.timed_out, "output_limit": result.output_limit,
                        "nonce": result.nonce, "previous_nonce": result.previous_nonce,
-                       "window_id": result.window_id, "pointer_clicks": result.pointer_clicks,
+                       "window_id": result.window_id, "second_window_id": result.second_window_id,
+                       "second_opened": result.second_opened, "minimized": result.minimized,
+                       "restored": result.restored, "close_via_dock": result.close_via_dock,
+                       "menu_targets": result.menu_targets,
+                       "compact_target": result.compact_target,
+                       "terminal_target": result.terminal_target,
+                       "pointer_clicks": result.pointer_clicks,
                        "preference_toggled": result.preference_toggled,
                        "keyboard_sent": result.keyboard_sent, "exit_sent": result.exit_sent,
                        "powerdown_sent": result.powerdown_sent, "screenshots": result.screenshots})
@@ -540,8 +1227,9 @@ def main() -> int:
                        "manifest_sha256": bound[OUT / "manifest.json"]})
         make_overlay("test")
         make_overlay("negative")
+        make_overlay("shell-negative")
         previous = None
-        for name in ("round1", "round2", "negative"):
+        for name in ("round1", "round2", "negative", "shell-negative"):
             print(f"phase3: boot {name}", flush=True)
             outcome, record = boot(name, args.timeout, release, source,
                                    previous if name == "round2" else None)
@@ -557,7 +1245,7 @@ def main() -> int:
         p2.validate_unchanged(bound)
         report["status"] = "pass"
         save_report(report)
-        print("phase3: native shell/HID/persistence/negative evidence PASS")
+        print("phase3: native launcher/dual-window Dock/scratchpad/kill/HID/persistence/negative evidence PASS")
         return 0
     except (Phase3Failure, p2.SmokeFailure, OSError, UnicodeError, subprocess.SubprocessError) as error:
         report["error"] = str(error)

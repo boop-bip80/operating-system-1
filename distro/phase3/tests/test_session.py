@@ -39,6 +39,15 @@ class SessionWaylandDiscoveryTests(unittest.TestCase):
         if guard is None:
             raise AssertionError("production Wayland-display validation is missing")
         cls.guard = guard.group(1)
+        # The production gate must require wlroots' actual Pixman-construction
+        # log, not merely a WLR_RENDERER environment selector.
+        pixman = re.search(
+            r'''(?m)^grep -Eq '([^'\n]+)' "\$sway_log"$''',
+            cls.source,
+        )
+        if pixman is None:
+            raise AssertionError("production Pixman renderer creation gate is missing")
+        cls.pixman_pattern = pixman.group(1)
 
     def discover(self, log: str) -> str:
         # Apply the production sed expression to input bytes via stdin, then
@@ -81,6 +90,42 @@ class SessionWaylandDiscoveryTests(unittest.TestCase):
         for log in samples:
             with self.subTest(log=log):
                 self.assertTrue(self.discover(log).startswith("rejected:"))
+
+    def test_real_wlroots_pixman_renderer_creation_is_required(self) -> None:
+        # Execute the *production* grep expression against representative
+        # logged wlroots bytes. These are host fixtures, not QEMU runtime proof.
+        def accepted(log: str) -> bool:
+            result = subprocess.run(
+                ["grep", "-Eq", self.pixman_pattern],
+                input=log, capture_output=True, text=True, timeout=5,
+            )
+            return result.returncode == 0
+
+        self.assertTrue(accepted(
+            "00:00:00.155 [INFO] [wlr] "
+            "[render/pixman/renderer.c:328] Creating pixman renderer\n"
+        ))
+        for bad in (
+            "",
+            "Loading WLR_RENDERER option: pixman\n",
+            "Creating pixman renderer\n",
+            "[render/gles2/renderer.c:328] Creating pixman renderer\n",
+            "[render/pixman/renderer.c:abc] Creating pixman renderer\n",
+            "[render/pixman/renderer.c:328] Failed to create pixman renderer\n",
+            "[render/pixman/renderer.c:328] Creating pixman renderer: fake\n",
+        ):
+            with self.subTest(log=bad):
+                self.assertFalse(accepted(bad))
+
+        # The log is truncated before this Sway instance starts; the guest
+        # emits an explicit auditable success marker only after the real gate.
+        self.assertIn(': > "$sway_log"', self.source)
+        marker = "printf 'P3:PIXMAN_RENDERER_CREATED\\n'"
+        ready = "printf 'P3:SWAY_READY\\n'"
+        self.assertEqual(self.source.count(marker), 1)
+        self.assertLess(self.source.index("Creating pixman renderer$"),
+                        self.source.index(marker))
+        self.assertLess(self.source.index(marker), self.source.index(ready))
 
     def test_supervisor_checks_pid_bound_ipc_and_passes_detected_display(self) -> None:
         self.assertIn('sway-ipc.1000.$sway_pid.sock', self.source)

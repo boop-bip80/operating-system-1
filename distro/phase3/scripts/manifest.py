@@ -145,7 +145,7 @@ def create() -> None:
                  "GITHUB_RUN_ATTEMPT", "RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion")
     payload = {
         "schema_version": 1, "phase": 3,
-        "scope": "Sway DRM/Pixman shell; real GtkLayerShell Dock, foot HID, persistence and no-GPU control",
+        "scope": "Sway DRM/Pixman shell; real GtkLayerShell Dock, foot HID, persistence, no-GPU and GTK-failure controls",
         "source_sha": sha, "source_revision": revision, "source_dirty": dirty,
         "source_fingerprint": fingerprint,
         "source_tree": command(["git", "rev-parse", "HEAD^{tree}"]),
@@ -215,12 +215,80 @@ def verify() -> None:
     require(report.get("manifest_sha256") == digest(safe_file("manifest.json")),
             "test-results are not bound to the exact immutable build manifest")
     cases = report.get("cases")
-    require(isinstance(cases, list) and [c.get("name") for c in cases] ==
-            ["round1", "round2", "negative"], "missing or reordered graphical scenarios")
+    require(isinstance(cases, list) and len(cases) == 4 and
+            all(isinstance(case, dict) for case in cases) and
+            [case.get("name") for case in cases] ==
+            ["round1", "round2", "negative", "shell-negative"],
+            "missing, malformed or reordered Phase 3 scenarios")
+    required_stages = (
+        "ready", "launcher", "preferences", "foot", "saved", "second",
+        "focused", "menu_minimize", "hidden", "restored", "menu_close",
+        "closed", "desktop",
+    )
+    require(tuple(smoke.SCREEN_STAGES) == required_stages and
+            tuple(smoke.FOOT_CONTENT_BOX) == (132, 116, 680, 284) and
+            tuple(smoke.MENU_POPUP_BOX) == (380, 495, 690, 755) and
+            tuple(smoke.LAUNCHER_BOX) == (20, 52, 375, 420) and
+            tuple(smoke.DOCK_ICON_BOX) == (492, 704, 532, 740),
+            "Phase 3 IPC/Dock/launcher QMP screenshot/ROI contract changed without verifier review")
+    require(smoke.BOOT_MARKERS.index("P3:PIXMAN_RENDERER_CREATED") ==
+            smoke.BOOT_MARKERS.index("P3:DRM_MODESET_REQUESTED:Virtual-1") + 1,
+            "live wlroots Pixman renderer proof must follow real DRM modeset marker")
     first_nonce = None
+    first_ready_frame = None
     for case in cases:
         name = case["name"]
         require(case.get("status") == "pass", f"{name} did not pass")
+        require(type(case.get("returncode")) is int and case["returncode"] == 0 and
+                type(case.get("timed_out")) is bool and not case["timed_out"] and
+                type(case.get("output_limit")) is bool and not case["output_limit"],
+                f"{name} lacks a clean native QEMU process/shutdown result")
+        require(type(case.get("pointer_clicks")) is int and case["pointer_clicks"] >= 0,
+                f"{name} has invalid host pointer input count")
+        for flag in ("second_opened", "minimized", "restored", "close_via_dock",
+                     "preference_toggled", "keyboard_sent", "exit_sent", "powerdown_sent"):
+            require(type(case.get(flag)) is bool,
+                    f"{name} lacks a strict boolean for {flag}")
+        for key in ("window_id", "second_window_id"):
+            identifier = case.get(key)
+            require(identifier is None or
+                    (isinstance(identifier, str) and
+                     re.fullmatch(r"[1-9][0-9]*", identifier) is not None),
+                    f"{name} has invalid Sway IPC container identifier {key}")
+        require(isinstance(case.get("screenshots"), dict),
+                f"{name} screenshots evidence is not a mapping")
+        for target_key in ("compact_target", "terminal_target"):
+            target = case.get(target_key)
+            if name in ("round1", "round2"):
+                require(isinstance(target, list) and len(target) == 4 and
+                        all(type(value) is int for value in target),
+                        f"{name} lacks real four-dimensional mapped GTK {target_key} geometry")
+            else:
+                require(target is None,
+                        f"{name} negative case claims a mapped GTK {target_key}")
+        menu_targets = case.get("menu_targets")
+        require(isinstance(menu_targets, dict),
+                f"{name} lacks recorded, framebuffer-calibrated popup menu targets")
+        if name in ("round1", "round2"):
+            require(set(menu_targets) == {"Minimize", "Close"} and all(
+                isinstance(point, list) and len(point) == 2 and
+                all(type(value) is int for value in point)
+                for point in menu_targets.values()),
+                f"{name} has malformed real GTK Dock menu click coordinates")
+        else:
+            require(menu_targets == {},
+                    f"{name} negative case unexpectedly claimed GUI Dock menu clicks")
+        mode = ("negative" if name == "negative" else
+                ("shell-negative" if name == "shell-negative" else "test"))
+        disk = ("negative.qcow2" if name == "negative" else
+                ("shell-negative.qcow2" if name == "shell-negative" else "test.qcow2"))
+        command_line = ["bash", str(PHASE / "scripts" / "boot-qemu.sh"),
+                        "--mode", mode, "--name", name, "--disk", str(OUT / disk)]
+        require(case.get("mode") == mode and case.get("command") == command_line,
+                f"{name} QEMU mode/overlay command is not bound to its acceptance scenario")
+        if name == "shell-negative":
+            # Independent writable disk, not a reused positive test overlay.
+            safe_file(disk)
         for field, relative in (("serial_log", f"logs/boot-{name}.log"),
                                 ("qmp_log", f"logs/qmp-{name}.jsonl")):
             require(case.get(field) == relative, f"{name} has invalid evidence path")
@@ -233,22 +301,51 @@ def verify() -> None:
             returncode=case.get("returncode", -1), timed_out=case.get("timed_out", True),
             output_limit=case.get("output_limit", True), previous_nonce=case.get("previous_nonce"),
             nonce=case.get("nonce"), window_id=case.get("window_id"),
-            pointer_clicks=case.get("pointer_clicks", 0),
-            preference_toggled=case.get("preference_toggled", False),
+            second_window_id=case.get("second_window_id"),
+            second_opened=case["second_opened"], minimized=case["minimized"],
+            restored=case["restored"], close_via_dock=case["close_via_dock"],
+            menu_targets=case["menu_targets"],
+            compact_target=case.get("compact_target"),
+            terminal_target=case.get("terminal_target"),
+            pointer_clicks=case["pointer_clicks"],
+            preference_toggled=case["preference_toggled"],
             keyboard_sent=case.get("keyboard_sent", False), exit_sent=case.get("exit_sent", False),
             powerdown_sent=case.get("powerdown_sent", False), screenshots=case.get("screenshots", {}),
         )
         if name == "negative":
             smoke.validate_negative(result, manifest["kernel_release"], manifest["source_revision"])
+        elif name == "shell-negative":
+            smoke.validate_shell_negative(result, manifest["kernel_release"], manifest["source_revision"])
         else:
             require(result.previous_nonce == (first_nonce if name == "round2" else None),
                     f"{name} nonce lineage is broken")
             smoke.validate_positive(result, manifest["kernel_release"], manifest["source_revision"])
+            # Parse the mapped GTK allocations directly from the SHA-bound
+            # serial log. The JSON summary cannot supply arbitrary hitboxes
+            # even if its QMP event list is otherwise internally consistent.
+            for kind, field in (("COMPACT", "compact_target"),
+                                ("TERMINAL", "terminal_target")):
+                require(getattr(result, field) == list(smoke.gtk_target_from_output(
+                    result.output, kind)),
+                    f"{name} recorded {field} disagrees with native GTK allocation")
             if name == "round1":
                 first_nonce = result.nonce
+            # Reconstruct the genuine two-foot Sway get_tree sequence from
+            # the SHA-bound serial bytes before checking QMP framebuffer data.
+            # The production validator checks each id/PID/focus/scratchpad
+            # transition against its corresponding on-wire IPC snapshots.
+            snapshots = smoke.ipc_states(smoke.lines(result.output))
+            require(snapshots and snapshots[-1][1]["seq"] == len(snapshots),
+                    f"{name} Sway IPC state sequence was not complete")
+            require(set(result.screenshots) == set(required_stages) and
+                    len(result.screenshots) == len(required_stages),
+                    f"{name} lacks one of the 13 required real QMP screen stages")
             frames = {}
-            for stage in smoke.SCREEN_STAGES:
+            for stage in required_stages:
                 proof = result.screenshots[stage]
+                require(isinstance(proof, dict) and set(proof) ==
+                        {"path", "sha256", "png_path", "png_sha256", "width", "height"},
+                        f"{name} {stage} screenshot metadata is malformed")
                 expected = f"screenshots/{name}-{stage}.ppm"
                 preview = f"screenshots/{name}-{stage}.png"
                 require(proof.get("path") == expected and proof.get("png_path") == preview,
@@ -262,15 +359,95 @@ def verify() -> None:
                 require(smoke.p2.png_bytes(frame) == png_file.read_bytes(),
                         "PNG preview is not a lossless export of the QEMU PPM")
                 frames[stage] = frame
+            require(smoke.changed_fraction(frames["ready"], frames["launcher"],
+                                           box=smoke.LAUNCHER_BOX) >= .015,
+                    "native Applications launcher did not visibly map before GTK clicks")
+            if name == "round1":
+                require(smoke.changed_fraction(frames["launcher"], frames["preferences"],
+                                               box=smoke.DOCK_ICON_BOX) >= .025,
+                        "actual GTK Compact checkbox did not visibly shrink Dock icon")
+            else:
+                require(smoke.changed_fraction(frames["ready"], frames["preferences"],
+                                               box=smoke.LAUNCHER_BOX) >= .015,
+                        "second boot did not visibly display the GTK launcher")
             require(smoke.changed_fraction(frames["ready"], frames["foot"]) >= .07,
                     "real foot window did not change the framebuffer")
-            require(smoke.changed_fraction(frames["ready"], frames["preferences"]) >= .025,
-                    "Applications/Compact Dock settings did not render")
-            require(smoke.changed_fraction(frames["foot"], frames["desktop"]) >= .07,
-                    "closed application did not disappear from framebuffer")
+            require(smoke.changed_fraction(
+                frames["saved"], frames["second"],
+                box=smoke.FOOT_CONTENT_BOX) >= .001,
+                    "a second real Sway terminal did not change its real window pixels")
+            require(smoke.changed_fraction(
+                frames["second"], frames["focused"],
+                box=smoke.FOOT_CONTENT_BOX) >= .001,
+                    "Dock focus switch between two live foot clients was not visible")
+            require(smoke.changed_fraction(
+                frames["focused"], frames["menu_minimize"],
+                box=smoke.MENU_POPUP_BOX) >= .003,
+                    "real Dock Minimize menu was not visible")
+            require(smoke.changed_fraction(
+                frames["focused"], frames["hidden"],
+                box=smoke.FOOT_CONTENT_BOX) >= .001,
+                    "Sway scratchpad minimization did not change the real foot pixels")
+            require(smoke.changed_fraction(
+                frames["hidden"], frames["restored"],
+                box=smoke.FOOT_CONTENT_BOX) >= .001,
+                    "Sway scratchpad restoration did not change the real foot pixels")
+            require(smoke.changed_fraction(
+                frames["restored"], frames["menu_close"],
+                box=smoke.MENU_POPUP_BOX) >= .003,
+                    "real Dock Close menu was not visible")
+            require(smoke.changed_fraction(
+                frames["restored"], frames["closed"],
+                box=smoke.FOOT_CONTENT_BOX) >= .001,
+                    "Dock Close did not remove its target from the real foot pixels")
+            require(smoke.changed_fraction(frames["closed"], frames["desktop"]) >= .07,
+                    "surviving terminal did not visibly exit")
+            # A self-consistent forged coordinates/QMP transcript is insufficient:
+            # independently infer both real GTK popup rows from the exact
+            # SHA-bound PPM framebuffer bytes, then check the recorded QMP HID.
+            calibrated_targets = {
+                "Minimize": list(smoke.popup_menu_target(
+                    frames["focused"], frames["menu_minimize"], "Minimize")),
+                "Close": list(smoke.popup_menu_target(
+                    frames["restored"], frames["menu_close"], "Close")),
+            }
+            require(result.menu_targets == calibrated_targets,
+                    f"{name} recorded Dock context menu targets do not match real QEMU pixels")
+            if name == "round1":
+                first_ready_frame = frames["ready"]
+            else:
+                require(first_ready_frame is not None,
+                        "second boot cannot be compared with first GPU ready scanout")
+                # Verify the real persisted icon is visibly smaller before any
+                # second-boot input. Both frames were read from independently
+                # SHA-256-bound QMP PPMs, not JSON claims or generated previews.
+                smoke.prove_compact_dock_visible(first_ready_frame, frames["ready"])
+                roi = (492, 704, 532, 740)
+                require(smoke.changed_fraction(first_ready_frame, frames["ready"],
+                                               box=roi) >= .025,
+                        "second-boot Compact Dock pixels did not change in icon ROI")
+                def bright_count(frame):
+                    x1, y1, x2, y2 = roi
+                    bright = 0
+                    for y in range(y1, y2):
+                        for x in range(x1, x2):
+                            start = (y * frame.width + x) * 3
+                            r, g, b = frame.pixels[start:start + 3]
+                            bright += (r >= 150 and g >= 160 and b >= 170)
+                    return bright
+                require(bright_count(first_ready_frame) >=
+                        bright_count(frames["ready"]) + 20,
+                        "second-boot Dock icon did not shrink in original QMP scanout")
+        # Replay every successful QMP screendump retry, real keyboard chord,
+        # GTK Dock popup pointer clicks and powerdown from the hashed JSONL log.
+        # Delayed GTK mapping cannot be hidden by skipped/unacknowledged QMP.
+        # No screenshot or serial IPC marker alone can qualify.
         smoke.transcript(qmp.read_text(), result.nonce, result.screenshots,
-                         preference_toggled=result.preference_toggled)
-    print(f"phase3: all three original-shell QMP cases verified for {manifest['source_sha']}")
+                         preference_toggled=result.preference_toggled,
+                         menu_targets=result.menu_targets,
+                         compact_target=result.compact_target,
+                         terminal_target=result.terminal_target)
+    print(f"phase3: four source-bound graphical/IPC/fault cases, 13 QMP stages per positive boot verified for {manifest['source_sha']}")
 
 
 def main() -> int:

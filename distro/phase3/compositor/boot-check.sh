@@ -28,6 +28,13 @@ flag=/sys/firmware/qemu_fw_cfg/by_name/opt/phase3/test/raw
 if [[ -f "$flag" && "$(tr -d '\0' < "$flag")" == 1 ]]; then
     touch /run/phase3/test-mode
 fi
+# A separate fw_cfg key can request a deliberately broken *GTK child only*.
+# It cannot arm outside test mode; /run is volatile, not persisted in the image.
+shell_fault=/sys/firmware/qemu_fw_cfg/by_name/opt/phase3/fail-shell/raw
+if [[ -f "$shell_fault" && "$(tr -d '\0' < "$shell_fault")" == 1 ]]; then
+    [[ -f /run/phase3/test-mode && ! -L /run/phase3/test-mode ]]
+    install -m 600 /dev/null /run/phase3/fail-shell
+fi
 state=/home/desktop/.local/state/phase3/nonce
 if [[ ! -e "$state" && ! -L "$state" ]]; then
     printf 'P3:PERSISTED:EMPTY\n'

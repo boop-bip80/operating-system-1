@@ -30,6 +30,15 @@ SWAYMSG = "/usr/bin/swaymsg"
 STYLE = "/usr/share/phase3/style.css"
 POLL_SECONDS = 1
 LAUNCH_TIMEOUT = 30.0
+# Launcher is a Wayland layer surface anchored at these pixel margins.
+LAUNCHER_LEFT = 14
+LAUNCHER_TOP = 43
+LAUNCHER_TARGET_INTERVAL_MS = 75
+LAUNCHER_TARGET_MAX_CHECKS = 120
+MAX_IPC_WINDOWS = 32
+MAX_IPC_SNAPSHOT_BYTES = 4096
+PROCESS_EXIT_TIMEOUT = 8.0
+MAX_PROCESS_WATCHES = 16
 P3_CONFIG = Path.home() / ".config" / "phase3" / "preferences.json"
 
 
@@ -66,6 +75,17 @@ class Toplevel:
     title: str
     focused: bool
     minimized: bool
+    scratchpad_state: str = "none"
+    visible: bool = True
+    pid: int | None = None
+
+
+@dataclass(frozen=True)
+class ProcessWatch:
+    con_id: int
+    pid: int
+    start_time: int
+    deadline: float
 
 
 def parse_toplevels(tree: Any) -> dict[int, Toplevel]:
@@ -85,13 +105,19 @@ def parse_toplevels(tree: Any) -> dict[int, Toplevel]:
                 app_id = legacy.get("class") or ""
             con_id = node.get("id")
             if app_id and type(con_id) is int and con_id > 0:
-                scratch = node.get("scratchpad_state", "none") != "none"
+                scratch = node.get("scratchpad_state") or "none"
+                scratch = scratch if isinstance(scratch, str) else "unknown"
+                visible = bool(node.get("visible", False))
+                raw_pid = node.get("pid")
                 found[con_id] = Toplevel(
                     con_id=con_id,
                     app_id=str(app_id),
                     title=str(node.get("name") or app_id),
                     focused=bool(node.get("focused", False)),
-                    minimized=scratch and not bool(node.get("visible", False)),
+                    minimized=scratch != "none" and not visible,
+                    scratchpad_state=scratch,
+                    visible=visible,
+                    pid=raw_pid if type(raw_pid) is int and raw_pid > 0 else None,
                 )
         for child in children:
             visit(child)
@@ -109,6 +135,142 @@ def valid_con_id(con_id: int) -> int:
 
 def is_terminal(item: Toplevel) -> bool:
     return "foot" in item.app_id.casefold()
+
+
+def dock_model(windows: dict[int, Toplevel]) -> tuple[Toplevel | None, tuple[Toplevel, ...]]:
+    """Pin the oldest real foot container, regardless of Sway tree traversal."""
+    terminal = min(
+        (item for item in windows.values() if is_terminal(item)),
+        key=lambda item: item.con_id, default=None,
+    )
+    others = tuple(sorted(
+        (item for item in windows.values() if not is_terminal(item)),
+        key=lambda item: item.con_id,
+    ))[:9]
+    return terminal, others
+
+
+def active_toplevel_id(windows: dict[int, Toplevel]) -> int | None:
+    focused = [item.con_id for item in windows.values() if item.focused]
+    if len(focused) > 1:
+        raise ValueError("Sway reported multiple focused client leaves")
+    return focused[0] if focused else None
+
+
+def ipc_signature(windows: dict[int, Toplevel]) -> tuple:
+    """Ignore noisy title changes; retain real window/focus/scratchpad state."""
+    return tuple(sorted(
+        (item.con_id, item.app_id, item.pid, item.focused, item.minimized,
+         item.scratchpad_state, item.visible)
+        for item in windows.values()
+    ))
+
+
+def ipc_snapshot(windows: dict[int, Toplevel], sequence: int) -> str:
+    """Bounded, auditable projection of a fresh Sway get_tree IPC response."""
+    if type(sequence) is not int or sequence <= 0:
+        raise ValueError("invalid IPC snapshot sequence")
+    if len(windows) > MAX_IPC_WINDOWS:
+        raise ValueError("Sway tree exceeds bounded IPC snapshot window limit")
+    payload = {
+        "seq": sequence,
+        "source": "sway.get_tree",
+        "windows": [
+            {
+                "id": item.con_id,
+                "app_id": item.app_id[:96],
+                "pid": item.pid,
+                "focused": item.focused,
+                "scratchpad_state": item.scratchpad_state[:24],
+                "visible": item.visible,
+                "minimized": item.minimized,
+            }
+            for item in sorted(windows.values(), key=lambda item: item.con_id)
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(encoded.encode("utf-8")) > MAX_IPC_SNAPSHOT_BYTES:
+        raise ValueError("Sway IPC snapshot exceeds serial evidence limit")
+    return encoded
+
+
+def window_events(previous: dict[int, Toplevel],
+                  current: dict[int, Toplevel]) -> list[str]:
+    """Only report transitions independently observed in successive get_tree replies."""
+    events: list[str] = []
+    for con_id, item in sorted(current.items()):
+        old_item = previous.get(con_id)
+        if old_item is None:
+            if is_terminal(item):
+                events.append("WINDOW_DISCOVERED:" + str(con_id) + ":foot")
+        elif old_item.minimized != item.minimized:
+            kind = "WINDOW_MINIMIZED:" if item.minimized else "WINDOW_RESTORED:"
+            events.append(kind + str(con_id))
+    for con_id in sorted(previous.keys() - current.keys()):
+        events.append("WINDOW_CLOSED:" + str(con_id))
+    active = active_toplevel_id(current)
+    if active is not None and active != active_toplevel_id(previous):
+        events.append("WINDOW_ACTIVATED:" + str(active))
+    return events
+
+
+def parse_proc_stat(content: str) -> tuple[int, str, int]:
+    """Extract PID, state and boot-tick starttime from Linux /proc/<pid>/stat.
+
+    The comm field is parenthesized and can itself contain spaces/parentheses.
+    Index fields only after its final close parenthesis; starttime is field 22.
+    """
+    if len(content) > 4096:
+        raise ValueError("oversized /proc stat")
+    split_at = content.rfind(") ")
+    head_at = content.find(" (")
+    if head_at <= 0 or split_at <= head_at:
+        raise ValueError("invalid /proc stat comm field")
+    pid_string = content[:head_at]
+    fields = content[split_at + 2:].split()
+    if not pid_string.isdecimal() or len(fields) < 20:
+        raise ValueError("incomplete /proc stat identity")
+    state = fields[0]
+    if len(state) != 1 or not state.isascii() or not state.isalpha():
+        raise ValueError("invalid /proc process state")
+    try:
+        start_time = int(fields[19], 10)
+    except ValueError as exc:
+        raise ValueError("invalid /proc starttime") from exc
+    if start_time <= 0:
+        raise ValueError("invalid /proc starttime")
+    return int(pid_string), state, start_time
+
+
+def read_proc_state(pid: int) -> tuple[str, int] | None:
+    """Read only a bounded kernel /proc record; None means PID directory gone."""
+    if type(pid) is not int or not 0 < pid <= 2**31 - 1:
+        raise ValueError("invalid Sway-reported process PID")
+    path = Path("/proc") / str(pid) / "stat"
+    try:
+        if path.parent.is_symlink() or path.is_symlink():
+            raise ValueError("unsafe /proc process path")
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            content = stream.read(4097)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    observed_pid, state, start_time = parse_proc_stat(content)
+    if observed_pid != pid:
+        raise ValueError("/proc PID identity changed")
+    return state, start_time
+
+
+def process_exit_status(pid: int, original_start_time: int) -> str:
+    """Never certify a reused PID or a still-running process as terminated."""
+    if type(original_start_time) is not int or original_start_time <= 0:
+        raise ValueError("invalid observed process starttime")
+    current = read_proc_state(pid)
+    if current is None:
+        return "exited"
+    state, start_time = current
+    if start_time != original_start_time:
+        return "reused"
+    return "exited" if state == "Z" else "running"
 
 
 def read_preferences() -> dict[str, bool]:
@@ -186,10 +348,14 @@ class Phase3Shell:
         self.toplevels: dict[int, Toplevel] = {}
         self._dock_signature: tuple[Any, ...] | None = None
         self._pending_focus: set[int] = set()
+        self._pending_process_exits: dict[int, ProcessWatch] = {}
         self._launch_requests: list[tuple[float, str]] = []
         self._ready = False
         self._startup_checks = 0
         self._last_ipc_warning = 0.0
+        self._ipc_sequence = 0
+        self._launcher_target_generation = 0
+        self._launcher_target_checks = 0
         self.apps = self._desktop_apps()
         self._load_style()
         self._make_bar()
@@ -247,7 +413,7 @@ class Phase3Shell:
             (GtkLayerShell.Edge.BOTTOM,), 88, 60,
         )
         GtkLayerShell.set_margin(self.dock, GtkLayerShell.Edge.BOTTOM, 8)
-        GtkLayerShell.set_exclusive_zone(self.dock, 0)
+        GtkLayerShell.set_exclusive_zone(self.dock, 68)
         styled(self.dock, "phase3-dock")
         self.dock_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self.dock_box.set_border_width(6)
@@ -258,8 +424,8 @@ class Phase3Shell:
             "Phase3 Application Launcher", GtkLayerShell.Layer.OVERLAY,
             (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.LEFT), 380, 432,
         )
-        GtkLayerShell.set_margin(self.launcher, GtkLayerShell.Edge.TOP, 43)
-        GtkLayerShell.set_margin(self.launcher, GtkLayerShell.Edge.LEFT, 14)
+        GtkLayerShell.set_margin(self.launcher, GtkLayerShell.Edge.TOP, LAUNCHER_TOP)
+        GtkLayerShell.set_margin(self.launcher, GtkLayerShell.Edge.LEFT, LAUNCHER_LEFT)
         GtkLayerShell.set_exclusive_zone(self.launcher, 0)
         if hasattr(GtkLayerShell, "set_keyboard_mode"):
             GtkLayerShell.set_keyboard_mode(
@@ -292,42 +458,63 @@ class Phase3Shell:
         compact = Gtk.CheckButton(label="Compact Dock")
         compact.set_active(self.preferences["compact_dock"])
         compact.connect("toggled", self._compact_toggled)
+        self.compact_toggle = compact
         body.pack_start(compact, False, False, 0)
         self._fill_launcher()
 
     @staticmethod
     def _desktop_apps() -> list[Gio.AppInfo]:
-        apps: list[Gio.AppInfo] = []
+        # Capture each display name once while its errors are contained. A
+        # malformed desktop entry can return a non-string name, or fail on
+        # a subsequent getter; neither may crash the desktop at startup.
+        named: list[tuple[str, Gio.AppInfo]] = []
         for app in Gio.AppInfo.get_all():
             try:
-                if app.should_show() and app.get_name():
-                    apps.append(app)
-            except (GLib.Error, AttributeError):
+                if not app.should_show():
+                    continue
+                name = app.get_name()
+                if isinstance(name, str) and name:
+                    named.append((name.casefold(), app))
+            except (GLib.Error, AttributeError, TypeError, ValueError):
                 continue
-        return sorted(apps, key=lambda a: a.get_name().casefold())
+        named.sort(key=lambda item: item[0])
+        return [app for _, app in named]
 
     def _fill_launcher(self) -> None:
+        self.terminal_row = None
         for child in self.app_list.get_children():
             self.app_list.remove(child)
         query = self.search.get_text().strip().casefold()
         if not query or "terminal".find(query) >= 0 or "foot".find(query) >= 0:
             button = self._launcher_row("Terminal", "utilities-terminal-symbolic")
+            self.terminal_row = button
             button.connect("clicked", lambda *_: self.launch_terminal())
             self.app_list.pack_start(button, False, False, 0)
         count = 0
         for app in self.apps:
             if count >= 60:
                 break
-            name = app.get_name()
-            desktop_id = app.get_id() or ""
-            if desktop_id.casefold().startswith("foot."):
+            try:
+                # The installed desktop-entry database is an input boundary:
+                # getters can raise or return malformed types even after
+                # the startup index validated the entry earlier.
+                name = app.get_name()
+                desktop_id = app.get_id() or ""
+                icon = app.get_icon()
+                if not isinstance(name, str) or not name or not isinstance(desktop_id, str):
+                    continue
+                if desktop_id.casefold().startswith("foot."):
+                    continue
+                if query and query not in name.casefold():
+                    continue
+                button = self._launcher_row(name, "application-x-executable-symbolic", icon)
+                button.connect("clicked", lambda _btn, item=app: self._launch_desktop_app(item))
+                self.app_list.pack_start(button, False, False, 0)
+                count += 1
+            except (GLib.Error, AttributeError, TypeError, ValueError):
+                # Skip only this malformed entry; real Gio.AppInfo.launch is
+                # still the sole route for installed desktop applications.
                 continue
-            if query and query not in name.casefold():
-                continue
-            button = self._launcher_row(name, "application-x-executable-symbolic", app.get_icon())
-            button.connect("clicked", lambda _btn, item=app: self._launch_desktop_app(item))
-            self.app_list.pack_start(button, False, False, 0)
-            count += 1
         self.app_list.show_all()
 
     @staticmethod
@@ -356,6 +543,60 @@ class Phase3Shell:
                 return True
         return False
 
+    def _launcher_widget_target(self, widget: Gtk.Widget | None) -> tuple[int, int, int, int] | None:
+        """Return a mapped GTK widget's true clickable center in QEMU pixels.
+
+        GTK3 PyGObject translate_coordinates returns (x, y) or None, relative
+        to the launcher allocation. Its layer-shell TOP/LEFT margins supply
+        the actual compositor-space origin, never a guessed widget row.
+        """
+        if widget is None or not self.launcher.get_mapped() or not widget.get_mapped():
+            return None
+        width = widget.get_allocated_width()
+        height = widget.get_allocated_height()
+        if width < 12 or height < 12:
+            return None
+        point = widget.translate_coordinates(self.launcher, width // 2, height // 2)
+        if point is None or len(point) != 2:
+            return None
+        rel_x, rel_y = point
+        launcher_width = self.launcher.get_allocated_width()
+        launcher_height = self.launcher.get_allocated_height()
+        # A center can be mapped yet clipped. Prove the complete allocation
+        # fits within the real launcher surface before advertising a hitbox.
+        rel_left = rel_x - width // 2
+        rel_top = rel_y - height // 2
+        if not (
+            0 <= rel_left and rel_left + width <= launcher_width
+            and 0 <= rel_top and rel_top + height <= launcher_height
+        ):
+            return None
+        center_x = LAUNCHER_LEFT + rel_x
+        center_y = LAUNCHER_TOP + rel_y
+        screen = Gdk.Screen.get_default()
+        if screen is None or not (
+            0 <= center_x < screen.get_width() and 0 <= center_y < screen.get_height()
+        ):
+            return None
+        return center_x, center_y, width, height
+
+    def _report_launcher_targets(self, generation: int) -> bool:
+        """Log both targets exactly once after the real Wayland popup maps."""
+        if generation != self._launcher_target_generation or not self.launcher.get_visible():
+            return False
+        self._launcher_target_checks += 1
+        compact = self._launcher_widget_target(self.compact_toggle)
+        terminal = self._launcher_widget_target(self.terminal_row)
+        if compact is not None and terminal is not None:
+            emit("COMPACT_TARGET:" + ":".join(str(value) for value in compact))
+            emit("TERMINAL_TARGET:" + ":".join(str(value) for value in terminal))
+            return False
+        if self._launcher_target_checks >= LAUNCHER_TARGET_MAX_CHECKS:
+            print("phase3: launcher controls never mapped with valid allocations",
+                  file=sys.stderr, flush=True)
+            return False
+        return True
+
     def toggle_launcher(self) -> None:
         if self.launcher.get_visible():
             self.hide_launcher()
@@ -365,9 +606,16 @@ class Phase3Shell:
         self.launcher.show_all()
         self.launcher.present()
         self.search.grab_focus()
+        self._launcher_target_generation += 1
+        self._launcher_target_checks = 0
         emit("LAUNCHER_OPEN")
+        GLib.timeout_add(LAUNCHER_TARGET_INTERVAL_MS, self._report_launcher_targets,
+                         self._launcher_target_generation)
 
     def hide_launcher(self) -> None:
+        # Any post-map callback queued for the old popup must never advertise
+        # stale hitboxes after the user hides or reopens it.
+        self._launcher_target_generation += 1
         self.launcher.hide()
 
     def _compact_toggled(self, control: Gtk.CheckButton) -> None:
@@ -382,7 +630,7 @@ class Phase3Shell:
 
     def launch_terminal(self) -> None:
         self.hide_launcher()
-        existing = next((w for w in self.toplevels.values() if is_terminal(w)), None)
+        existing, _ = dock_model(self.toplevels)
         if existing is not None:
             self.focus_window(existing.con_id)
             return
@@ -424,15 +672,33 @@ class Phase3Shell:
         command = "scratchpad show" if item.minimized else "focus"
         if self._sway_command(item.con_id, command):
             self._pending_focus.add(item.con_id)
-            GLib.timeout_add(175, self._poll_windows)
+            GLib.timeout_add(175, self._poll_once)
 
     def minimize_window(self, con_id: int) -> None:
         self._sway_command(con_id, "move scratchpad")
-        GLib.timeout_add(175, self._poll_windows)
+        GLib.timeout_add(175, self._poll_once)
 
     def close_window(self, con_id: int) -> None:
-        self._sway_command(con_id, "kill")
-        GLib.timeout_add(175, self._poll_windows)
+        con_id = valid_con_id(con_id)
+        item = self.toplevels.get(con_id)
+        watch: ProcessWatch | None = None
+        if item is not None and item.pid is not None:
+            try:
+                identity = read_proc_state(item.pid)
+                if identity is not None and identity[0] != "Z":
+                    watch = ProcessWatch(
+                        con_id, item.pid, identity[1],
+                        time.monotonic() + PROCESS_EXIT_TIMEOUT,
+                    )
+            except (OSError, ValueError) as exc:
+                print("phase3: cannot bind Close to a live PID: " + str(exc),
+                      file=sys.stderr, flush=True)
+        if self._sway_command(con_id, "kill"):
+            # A successful command is NOT itself proof of exit. Wait until
+            # actual Sway tree removal AND same-process /proc termination.
+            if watch is not None and len(self._pending_process_exits) < MAX_PROCESS_WATCHES:
+                self._pending_process_exits[con_id] = watch
+        GLib.timeout_add(175, self._poll_once)
 
     def _window_menu(self, widget: Gtk.Button) -> None:
         focused = next((item for item in self.toplevels.values() if item.focused), None)
@@ -473,11 +739,7 @@ class Phase3Shell:
         return True
 
     def _refresh_dock(self) -> None:
-        terminal = next((w for w in self.toplevels.values() if is_terminal(w)), None)
-        other = sorted(
-            (w for w in self.toplevels.values() if not is_terminal(w)),
-            key=lambda w: w.con_id,
-        )
+        terminal, other = dock_model(self.toplevels)
         signature = (
             self.preferences["compact_dock"],
             None if terminal is None else (terminal.con_id, terminal.focused, terminal.minimized),
@@ -498,7 +760,7 @@ class Phase3Shell:
                 "button-press-event", self._dock_right_click, terminal.con_id,
             )
         self.dock_box.pack_start(terminal_button, False, False, 0)
-        for item in other[:9]:
+        for item in other:
             label = item.app_id.replace(".", " ").split()[0][:14] or "App"
             button = self._dock_button(
                 label, "application-x-executable-symbolic",
@@ -532,6 +794,50 @@ class Phase3Shell:
         self.clock.set_text(datetime.now().strftime("%a %d %b  %H:%M"))
         return True
 
+    def _record_ipc_snapshot(self, observed: dict[int, Toplevel]) -> None:
+        # Called only with parse_toplevels() from this process's actual Sway
+        # get_tree response; serial transcript is bound by the host manifest.
+        try:
+            payload = ipc_snapshot(observed, self._ipc_sequence + 1)
+        except ValueError as exc:
+            print("phase3: bounded IPC snapshot unavailable: " + str(exc),
+                  file=sys.stderr, flush=True)
+            return
+        self._ipc_sequence += 1
+        emit("IPC_TREE:" + payload)
+
+    def _poll_once(self) -> bool:
+        # GLib.timeout_add callbacks repeat when returning True. Keep the
+        # normal 1s poll, but schedule each post-action fast probe only once.
+        self._poll_windows()
+        return False
+
+    def _check_process_exits(self, observed: dict[int, Toplevel]) -> None:
+        for con_id, watch in list(self._pending_process_exits.items()):
+            if time.monotonic() > watch.deadline:
+                print("phase3: Close process proof timed out for " + str(con_id),
+                      file=sys.stderr, flush=True)
+                del self._pending_process_exits[con_id]
+                continue
+            if con_id in observed:
+                # A closed/disappeared Sway leaf must precede any PID proof.
+                continue
+            try:
+                status = process_exit_status(watch.pid, watch.start_time)
+            except (OSError, ValueError) as exc:
+                print("phase3: Close /proc probe failed: " + str(exc),
+                      file=sys.stderr, flush=True)
+                del self._pending_process_exits[con_id]
+                continue
+            if status == "reused":
+                # PID number is alive again but belongs to a different process.
+                print("phase3: PID reuse prevents Close exit proof: " + str(watch.pid),
+                      file=sys.stderr, flush=True)
+                del self._pending_process_exits[con_id]
+            elif status == "exited":
+                emit("PROCESS_EXITED:" + str(con_id) + ":" + str(watch.pid))
+                del self._pending_process_exits[con_id]
+
     def _check_ready(self) -> bool:
         if self._ready:
             return False
@@ -545,6 +851,7 @@ class Phase3Shell:
                 observed = parse_toplevels(sway_ipc("-t", "get_tree"))
                 self.toplevels = observed
                 self._ready = True
+                self._record_ipc_snapshot(observed)
                 emit("LAYER_SHELL_READY")
                 emit("SHELL_READY")
                 emit("PREFERENCE_STATE:compact_dock=" + str(self.preferences["compact_dock"]).lower())
@@ -562,29 +869,38 @@ class Phase3Shell:
     def _poll_windows(self) -> bool:
         if not self._ready:
             return False if self._startup_checks >= 120 else True
+        old = self.toplevels
         try:
             current = parse_toplevels(sway_ipc("-t", "get_tree"))
+            changes = window_events(old, current)
+            changed = ipc_signature(old) != ipc_signature(current)
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
             now = time.monotonic()
             if now - self._last_ipc_warning >= 10:
                 print("phase3: IPC refresh failed: " + str(exc), file=sys.stderr, flush=True)
                 self._last_ipc_warning = now
             return True
-        old = self.toplevels
-        for con_id, item in current.items():
-            if con_id not in old and is_terminal(item):
-                if self._launch_requests:
-                    self._launch_requests.pop(0)
-                    emit("APP_LAUNCHED:foot")
-                    # A launched client counts as focused only after Sway
-                    # itself reports focus, not merely after spawning it.
-                    self._pending_focus.add(con_id)
+        # Snapshot BEFORE evidence markers so the host can correlate each
+        # observed transition to the exact Sway container/PID/focus state.
+        pending_observed = any(cid in current and current[cid].focused
+                               for cid in self._pending_focus)
+        if changed or pending_observed:
+            self._record_ipc_snapshot(current)
+        for marker in changes:
+            emit(marker)
+        for con_id, item in sorted(current.items()):
+            if con_id not in old and is_terminal(item) and self._launch_requests:
+                self._launch_requests.pop(0)
+                emit("APP_LAUNCHED:foot")
+                # A launched client counts as focused only after Sway itself
+                # reports focus, not merely after spawning it.
+                self._pending_focus.add(con_id)
             if con_id in self._pending_focus and item.focused:
                 emit("WINDOW_FOCUSED:" + str(con_id))
                 self._pending_focus.remove(con_id)
         for con_id in old.keys() - current.keys():
-            emit("WINDOW_CLOSED:" + str(con_id))
             self._pending_focus.discard(con_id)
+        self._check_process_exits(current)
         now = time.monotonic()
         self._launch_requests = [
             request for request in self._launch_requests

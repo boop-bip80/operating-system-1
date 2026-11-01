@@ -70,8 +70,8 @@ This architecture is **chosen, not yet proved to run in this QEMU image**. In pa
 
 ### P3.1-D — Acceptance harness and anti-false-positive controls
 1. Extend the established QEMU/QMP method in a Phase 3-specific harness. Use a fresh host-generated challenge **after first observed graphical readiness**. Deliver it exclusively by real emulated input, never fw_cfg/kernel parameters/serial/guest-prewritten files.
-2. Capture source-bound serial logs, Sway/compositor logs, IPC tree snapshots, QMP JSONL, guest process/UID evidence, and actual GPU PPM+PNG frames for ready, launcher, terminal, Dock focus, hide, restore, close, and second-boot restored preference.
-3. Require the screenshots to show nonblank, expected **distinct** stages; correlate the screenshot times with actual QMP command acknowledgments and guest/Sway state. A generated bitmap, host desktop screenshot, mocked IPC response, echoed input, or success marker alone cannot pass.
+2. Capture source-bound serial logs, Sway/compositor logs, bounded IPC tree snapshots, QMP JSONL, guest process/UID evidence, and **13 exact GPU PPM+PNG stages per positive boot**: `ready`, `launcher`, `preferences`, `foot`, `saved`, `second`, `focused`, `menu_minimize`, `hidden`, `restored`, `menu_close`, `closed`, `desktop`.
+3. Require the screenshots to show nonblank, expected **distinct** stages; correlate screenshot times with actual QMP command acknowledgments, mapped GTK allocations for launcher Terminal/Compact Dock pointer targets, framebuffer-calibrated GTK Dock popup row coordinates, and guest/Sway state. A generated bitmap, guessed fixed pointer target, host desktop screenshot, mocked IPC response, echoed input, or success marker alone cannot pass.
 4. Boot the persistent disk a second time with a new firmware-variables copy and a fresh host challenge. Verify both stored preference and prior user data after reboot.
 5. Exercise the no-GPU control and at least one shell/compositor-start failure control with guest-stage evidence; rejected controls must not be counted as a healthy desktop. This tests fail-closed behavior, **not** automatic recovery/restart, which is deferred.
 6. Bound every boot (initial target: 420 seconds for positive cases, 300 seconds for negative controls), assert clean systemd/guest shutdown, fail for kernel panic/oops or unexpected service failure, and retain diagnostics even when tests fail.
@@ -97,14 +97,14 @@ All verdicts below are **PENDING** until proven on the exact source SHA being re
 | P3-06 | Real virtio DRM/KMS with Pixman, not nested/headless/X11 | Fresh Sway renderer/backend logs, DRM device identity, guest Wayland client and QEMU scanout | PENDING |
 | P3-07 | Original top bar and Dock use working layer-shell surfaces | Client/protocol diagnostics, layer output geometry and captured emulated framebuffer | PENDING |
 | P3-08 | Launcher lists real installed desktop entries safely | Indexed app IDs, negative malformed-entry tests and actual launcher screenshot | PENDING |
-| P3-09 | QMP pointer launches a real Terminal app | QMP event transcript, foot process and new mapped container in Sway tree | PENDING |
+| P3-09 | QMP pointer launches a real Terminal app | Source-emitted mapped GTK row allocation, actual QMP pointer transcript, foot PID and new mapped Sway container | PENDING |
 | P3-10 | Real keyboard text reaches the focused Terminal | Post-readiness random challenge, native app/guest acknowledgment, input transcript | PENDING |
 | P3-11 | Dock focus switching targets actual live windows | Before/after Sway `get_tree` focus state, QMP pointer and framebuffer changes | PENDING |
 | P3-12 | Dock hide/scratchpad and restore work; close really closes | Actual Sway IPC actions and tree/process/frame evidence for each transition | PENDING |
-| P3-13 | User-toggled Compact Dock persists through second boot | On-screen interaction, owned persisted file, independent round-2 read/visible state | PENDING |
+| P3-13 | User-toggled Compact Dock persists through second boot | Mapped GTK checkbox/QMP click, owned persisted file, round-2 disk read and smaller Dock icon proven by first-vs-second boot QMP PPM pixel ROI | PENDING |
 | P3-14 | Guest remains bounded and shuts down cleanly | Distinct fresh positive boots, total timeouts, QEMU exit and kernel powerdown proof | PENDING |
 | P3-15 | GPU and shell-start negative controls reject false desktop success | Guest-stage error markers, complete logs, no positive shell screenshot/markers | PENDING |
-| P3-16 | Graphical/IPC evidence is real, correlated, and tamper-detectable | PPM/PNG hashes, QMP/IPC logs, manifest-bound results and standalone verifier | PENDING |
+| P3-16 | Graphical/IPC evidence is real, correlated, and tamper-detectable | All 13 PPM+PNG stage hashes per positive boot, pixel-calibrated Dock menu targets, QMP/IPC logs, manifest-bound standalone verifier | PENDING |
 | P3-17 | Separate Phase 3 artifact is reproducible and reviewable | Image/firmware checksums, installation/launch instructions, license notices | PENDING |
 | P3-18 | Two independent complete Phase 3 attempts qualify one SHA | Two fresh-runner green attempts, distinct manifests/artifacts, full end-to-end verdicts | PENDING |
 
@@ -112,18 +112,24 @@ All verdicts below are **PENDING** until proven on the exact source SHA being re
 
 ## 5. Reviewer procedure and failure contract
 
-From a clean Linux x86-64 checkout of the target SHA, use the commands that the implemented `distro/phase3/Makefile` and CI actually support; these are **planned commands, not executable yet**:
+From a clean Linux x86-64 checkout of the target SHA, the implemented `distro/phase3/Makefile` and [Phase 3 workflow](https://github.com/boop-bip80/operating-system-1/actions/workflows/phase3-desktop.yml) provide the following executable targets. They require the documented signed Debian inputs, build/QEMU prerequisites and root privileges for userspace/image staging. Their existence, or a successful host-only `check`, **does not qualify the GUI**; `test` must complete the real QEMU scenarios and `verify` must accept their evidence.
 
 ```sh
 make -C distro/phase3 check
 make -C distro/phase3 kernel
-sudo make -C distro/phase3 userspace image
-make -C distro/phase3 manifest test verify artifact
+sudo make -C distro/phase3 userspace
+sudo make -C distro/phase3 image
+make -C distro/phase3 manifest
+make -C distro/phase3 test
+make -C distro/phase3 verify
+make -C distro/phase3 artifact
 ```
+
+**How to interpret native-rendering and IPC proof:** The implementation checks the supervised Sway PID's actual `/proc` environment for `WLR_RENDERER=pixman` and `WLR_BACKENDS=libinput,drm`, plus a fresh wlroots log line matching `[render/pixman/renderer.c:<line>] Creating pixman renderer`; only then does the supervisor emit `P3:PIXMAN_RENDERER_CREATED`. The [pinned Debian wlroots 0.18.2-3 source](https://sources.debian.org/src/wlroots/0.18.2-3/render/wlr_renderer.c/#L565) selects only `wlr_pixman_renderer_create()` for this explicit renderer option, with no GLES/Vulkan fallback. This is **direct, in-guest renderer-initialization log evidence plus source-backed interpretation**, not an independent renderer API query or a standalone proof of visible pixels: P3-06 additionally requires a live non-root Sway PID holding `/dev/dri/card0`, connected output/modeset logs, and independently changing QMP GPU scanout. `P3:IPC_TREE` lines are bounded, ordered JSON **projections of live Sway `get_tree` responses**, carrying container IDs, app IDs, PIDs, focus and scratchpad/visibility state—not unabridged compositor trees. The verifier must correlate these serial snapshots with real QMP input and hash-bound framebuffer files; shell-generated action markers alone cannot pass P3-11/12/16.
 
 1. Confirm source, dependency, kernel and package provenance; reject a dirty tree or an unavailable pinned dependency.
 2. Select two full successful [Phase 3 workflow](https://github.com/boop-bip80/operating-system-1/actions) runs/attempts for the exact SHA; open each complete artifact and check `SHA256SUMS`, manifest identity and `test-results.json` `pass`. Do not count a `not_validated` diagnostic bundle.
-3. Review actual GPU screenshots, QMP keyboard/mouse transcript, Sway IPC state, guest process identities, first/second boot persistence, negative control and clean shutdown.
+3. Review actual GPU screenshots, QMP keyboard/mouse transcript, Sway IPC state, guest process identities, first/second boot persistence, **both independent no-GPU and shell-start negative controls**, and clean shutdown.
 4. Independently confirm same-SHA [Phase 1](https://github.com/boop-bip80/operating-system-1/actions/workflows/phase1-boot.yml) and [Phase 2](https://github.com/boop-bip80/operating-system-1/actions/workflows/phase2-desktop.yml) success.
 5. Record immutable links, artifact IDs, checksums, reviewed acceptance rows and any exclusions in the release or review record. Keep lasting evidence beyond automatic artifact expiry.
 

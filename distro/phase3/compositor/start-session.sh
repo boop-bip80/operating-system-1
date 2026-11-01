@@ -82,14 +82,81 @@ display_socket="$XDG_RUNTIME_DIR/$display_name"
 SWAYSOCK="$sway_socket" timeout 3 /usr/bin/swaymsg -t get_tree -r >/dev/null
 WAYLAND_DISPLAY="$display_name" timeout 3 /usr/bin/wayland-info >/dev/null
 [[ "$(awk '/^Uid:/ { print $2 ":" $3 ":" $4 ":" $5 }' "/proc/$sway_pid/status")" == 1000:1000:1000:1000 ]]
+# Confirm the LIVE compositor inherited wlroots' fail-closed backend/renderer
+# choices. Read NUL-delimited /proc environ without logging unrelated values.
+sway_environment=()
+mapfile -d '' -t sway_environment < "/proc/$sway_pid/environ"
+for requirement in WLR_RENDERER=pixman WLR_BACKENDS=libinput,drm LIBSEAT_BACKEND=logind; do
+    matched=0
+    for entry in "${sway_environment[@]}"; do
+        if [[ "$entry" == "$requirement" ]]; then
+            matched=1
+            break
+        fi
+    done
+    [[ "$matched" == 1 ]]
+done
+unset sway_environment entry requirement matched
+# A successful Wayland socket by itself could come from a nested/headless
+# backend. Prove THIS Sway PID still holds the real virtio DRM character node.
+[[ -c /dev/dri/card0 && ! -L /dev/dri/card0 ]]
+drm_device=$(stat -Lc '%t:%T' /dev/dri/card0)
+drm_fd_found=0
+for fd in "/proc/$sway_pid/fd/"*; do
+    if [[ -c "$fd" ]] && [[ "$(stat -Lc '%t:%T' "$fd" 2>/dev/null)" == "$drm_device" ]]; then
+        drm_fd_found=1
+        break
+    fi
+done
+[[ "$drm_fd_found" == 1 ]]
+# Only log lines from the supervised DRM backend can establish a connected
+# native connector and modeset request. The QMP screendump proves scanout
+# changed later; a modeset request alone is not a successful displayed frame.
+grep -Eq "\\[backend/drm/drm\\.c:[0-9]+\\] Found connector 'Virtual-1'" "$sway_log"
+grep -Eq "\\[backend/drm/drm\\.c:[0-9]+\\] 'Virtual-1' connected" "$sway_log"
+grep -Eq "\\[backend/drm/drm\\.c:[0-9]+\\] connector Virtual-1: Requesting modeset" "$sway_log"
+# The pinned wlroots runtime writes this INFO line only when its real Pixman
+# renderer is created. A selector in /proc/environ alone is insufficient.
+grep -Eq '\[render/pixman/renderer\.c:[0-9]+\] Creating pixman renderer$' "$sway_log"
+printf 'P3:RENDERER_ENV:pixman\n'
+printf 'P3:BACKENDS_ENV:libinput,drm\n'
+printf 'P3:DRM_FD:card0\n'
+printf 'P3:DRM_MODESET_REQUESTED:Virtual-1\n'
+printf 'P3:PIXMAN_RENDERER_CREATED\n'
 printf 'P3:SWAY_READY\n'
 # Launch only after the real DRM compositor IPC and Wayland display are usable.
 # Unlike a sway.conf exec command this child is supervised; shell disappearance
 # is a hard failure, and a compositor reload cannot spawn duplicate chrome.
 export SWAYSOCK="$sway_socket" WAYLAND_DISPLAY="$display_name"
 reason=SHELL_START
-/usr/bin/python3 /usr/lib/phase3/shell.py &
+injected_failure=0
+if [[ -e /run/phase3/fail-shell || -L /run/phase3/fail-shell ]]; then
+    # Only the root-owned volatile flag from the guest fw_cfg test gate may
+    # override the actual GTK child's display; Sway/DRM/IPC already passed.
+    [[ -f /run/phase3/test-mode && ! -L /run/phase3/test-mode ]]
+    [[ -f /run/phase3/fail-shell && ! -L /run/phase3/fail-shell ]]
+    [[ "$(stat -c '%u:%a' /run/phase3/fail-shell)" == 0:600 ]]
+    invalid_display=wayland-phase3-intentionally-unavailable
+    [[ ! -e "$XDG_RUNTIME_DIR/$invalid_display" && ! -L "$XDG_RUNTIME_DIR/$invalid_display" ]]
+    injected_failure=1
+fi
+if (( injected_failure )); then
+    printf 'P3:INJECTED:SHELL_FAIL\n'
+    WAYLAND_DISPLAY="$invalid_display" /usr/bin/python3 /usr/lib/phase3/shell.py &
+else
+    /usr/bin/python3 /usr/lib/phase3/shell.py &
+fi
 shell_pid=$!
+reason=SHELL_EXIT
+if (( injected_failure )); then
+    # Reap the real failing GTK child deterministically even when its exit is
+    # faster than the supervisor's kill -0/wait -n setup.
+    if wait "$shell_pid"; then
+        reason=SHELL_UNEXPECTED_SUCCESS
+        failed
+    fi
+    failed
+fi
 kill -0 "$shell_pid"
 reason=SESSION_EXIT
 # Both processes must remain alive; a silently missing Dock fails acceptance.
