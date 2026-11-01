@@ -1,0 +1,169 @@
+# SPDX-License-Identifier: GPL-2.0
+name: Phase 3.2 Files integration (native Files UI NOT qualified)
+
+on:
+  push:
+    branches: [rcu-free-v3]
+    paths:
+      - '.github/workflows/phase3-files.yml'
+      - 'distro/phase3/**'
+      - 'drivers/gpu/drm/**'
+  pull_request:
+    paths:
+      - '.github/workflows/phase3-files.yml'
+      - 'distro/phase3/**'
+      - 'drivers/gpu/drm/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase3-files-${{ github.workflow }}-${{ github.ref }}
+  # New commits supersede pending work; completed evidence remains available.
+  cancel-in-progress: true
+
+jobs:
+  files-integration:
+    name: Verify Files packaging + inherited Phase 3.1 native QEMU (Files UI UNQUALIFIED)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      JOBS: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record CI environment and immutable source identity
+        run: |
+          set -euo pipefail
+          mkdir -p .build/phase3/logs
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          fields = (
+              "GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_REF",
+              "GITHUB_EVENT_NAME", "GITHUB_WORKFLOW", "GITHUB_RUN_ID",
+              "GITHUB_RUN_ATTEMPT", "RUNNER_OS", "RUNNER_ARCH",
+              "ImageOS", "ImageVersion",
+          )
+          evidence = {key: os.environ.get(key, "") for key in fields}
+          evidence["source_sha"] = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          epoch = subprocess.check_output(
+              ["git", "show", "-s", "--format=%ct", "HEAD"], text=True
+          ).strip()
+          evidence["source_date_epoch"] = int(epoch)
+          Path(".build/phase3/logs/ci-environment.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+          )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write("SOURCE_DATE_EPOCH=" + epoch + "\n")
+          PY
+
+      - name: Record fail-closed Files native qualification status
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output = Path(".build/phase3/logs/files-qualification.json")
+          if output.exists() or output.is_symlink():
+              raise SystemExit("Files native qualification status already exists")
+          output.write_text(json.dumps({
+              "schema_version": 1,
+              "phase": "3.2",
+              "source_sha": os.environ["GITHUB_SHA"],
+              "status": "not_validated",
+              "native_files_qmp_status": "not_validated",
+              "reason": "This integration workflow verifies source-bound Files package bytes and original Phase 3.1 real-QEMU regressions only. Independent Files GTK/Gio HID/QMP acceptance is not yet implemented.",
+          }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Install pinned-source build and QEMU verification prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev pkg-config \
+            rsync cpio gzip bzip2 xz-utils curl ca-certificates \
+            mmdebstrap debian-archive-keyring dpkg-dev gnupg \
+            qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin \
+            mtools dosfstools fdisk e2fsprogs util-linux \
+            shellcheck file python3 python3-pil git perl binutils
+          dpkg-query -W -f='${Package}\t${Version}\n' \
+            > .build/phase3/logs/host-packages.log
+
+      - name: Check desktop shell source, scripts and host-side validators
+        run: make -C distro/phase3 check
+
+      - name: ShellCheck the separate Files guest package identity checker
+        run: |
+          set -euo pipefail
+          bash -n distro/phase3/ci/files-package-check.sh
+          shellcheck -s bash distro/phase3/ci/files-package-check.sh
+
+      - name: Build this repository's x86-64 DRM-capable kernel
+        run: make -C distro/phase3 kernel
+
+      - name: Build signed-snapshot userspace and install original desktop shell
+        run: |
+          sudo --preserve-env=SOURCE_DATE_EPOCH,JOBS \
+            make -C distro/phase3 userspace
+
+      - name: Compare all four Files source assets with exact guest package bytes and modes
+        run: bash distro/phase3/ci/files-package-check.sh
+
+      - name: Build standalone UEFI desktop disk and firmware inputs
+        run: |
+          sudo --preserve-env=SOURCE_DATE_EPOCH,JOBS \
+            make -C distro/phase3 image
+
+      - name: Bind source, Debian dependencies, shell and boot artifacts
+        run: make -C distro/phase3 manifest
+
+      - name: Regress original Phase 3.1 native DRM shell, UI and negative controls (not Files QMP)
+        run: make -C distro/phase3 test
+
+      - name: Verify original Phase 3.1 source-bound desktop acceptance (Files UI remains unqualified)
+        run: make -C distro/phase3 verify
+
+      - name: Collect bootable desktop image and diagnostic evidence
+        if: ${{ always() }}
+        run: make -C distro/phase3 artifact
+
+      - name: Verify curated upload checksums
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          cd .build/phase3/artifacts
+          sha256sum --check --strict SHA256SUMS
+
+      - name: Upload Files packaging and Phase 3.1 regression evidence (NOT Files UI qualification)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: phase3-files-integration-UNQUALIFIED-${{ github.sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: .build/phase3/artifacts/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

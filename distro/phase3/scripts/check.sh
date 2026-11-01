@@ -27,6 +27,7 @@ from pathlib import Path
 import sys
 phase = Path(sys.argv[1])
 for path in (phase / "compositor/p3save", phase / "shell/shell.py",
+             phase / "files/files.py", phase / "files/safe_paths.py",
              phase / "scripts/manifest.py", phase / "scripts/smoke-test.py"):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 print("phase3: Python syntax validated")

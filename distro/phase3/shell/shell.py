@@ -997,9 +997,16 @@ class Phase3Shell:
             )
         self.dock_box.pack_start(terminal_button, False, False, 0)
         for item in other:
-            label = item.app_id.replace(".", " ").split()[0][:14] or "App"
+            # Files is a genuine, dynamically discovered Sway toplevel,
+            # never an additional pinned Dock item. Keep Terminal centered
+            # in the qualified one-window Phase 3.1 desktop.
+            if item.app_id == "org.phase3.Files":
+                label, icon_name = "Files", "system-file-manager-symbolic"
+            else:
+                label = item.app_id.replace(".", " ").split()[0][:14] or "App"
+                icon_name = "application-x-executable-symbolic"
             button = self._dock_button(
-                label, "application-x-executable-symbolic",
+                label, icon_name,
                 item.focused, True,
             )
             button.connect("clicked", lambda _button, cid=item.con_id: self.focus_window(cid))

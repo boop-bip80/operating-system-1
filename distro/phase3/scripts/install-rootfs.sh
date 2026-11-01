@@ -30,6 +30,17 @@ done
 [[ ! -e "$rootfs/etc/phase3-source" && ! -L "$rootfs/etc/phase3-source" ]] || {
     echo 'phase3: rootfs overlay is not fresh; use a fresh checkout/build' >&2; exit 1;
 }
+# Original Files browser is shipped as source-bound, root-owned read-only code.
+# Reject symlinked/missing assets before mutating the signed rootfs overlay.
+for asset in files.py safe_paths.py style.css phase3-files.desktop; do
+    source_asset="$phase_dir/files/$asset"
+    [[ -f "$source_asset" && ! -L "$source_asset" ]] || {
+        echo "phase3: missing or symlinked Files source $asset" >&2; exit 1;
+    }
+done
+grep -Fxq 'Exec=/usr/bin/python3 /usr/lib/phase3/files.py' "$phase_dir/files/phase3-files.desktop" || {
+    echo 'phase3: Files launcher must use its fixed non-shell entrypoint' >&2; exit 1;
+}
 grep -Fq "$DEBIAN_MIRROR" "$rootfs/etc/apt/sources.list"
 grep -Fq "$DEBIAN_SECURITY_MIRROR" "$rootfs/etc/apt/sources.list"
 if grep -Eq '(trusted=yes|allow-unauthenticated)' "$rootfs/etc/apt/sources.list"; then
@@ -72,7 +83,11 @@ restore_guest_resolver
 for guest_package in "${guest_packages[@]}"; do
     chroot "$rootfs" dpkg-query -W "$guest_package" >/dev/null
 done
+[[ ! -L "$rootfs/usr/share/applications" ]] || {
+    echo 'phase3: unsafe symlink for installed Files desktop entry directory' >&2; exit 1;
+}
 install -d -m 755 "$rootfs/usr/lib/phase3" "$rootfs/usr/share/phase3" "$rootfs/etc/phase3" "$rootfs/usr/local/bin"
+install -d -m 755 "$rootfs/usr/share/applications"
 install -d -m 755 "$rootfs/var/log/phase3"
 install -m 644 "$phase_dir/compositor/sway.conf" "$rootfs/etc/phase3/sway.conf"
 install -m 755 "$phase_dir/compositor/start-session.sh" "$rootfs/usr/lib/phase3/start-session.sh"
@@ -80,6 +95,10 @@ install -m 755 "$phase_dir/compositor/boot-check.sh" "$rootfs/usr/lib/phase3/boo
 install -m 755 "$phase_dir/compositor/p3save" "$rootfs/usr/local/bin/p3save"
 install -m 644 "$phase_dir/shell/shell.py" "$rootfs/usr/lib/phase3/shell.py"
 install -m 644 "$phase_dir/shell/style.css" "$rootfs/usr/share/phase3/style.css"
+install -m 755 "$phase_dir/files/files.py" "$rootfs/usr/lib/phase3/files.py"
+install -m 644 "$phase_dir/files/safe_paths.py" "$rootfs/usr/lib/phase3/safe_paths.py"
+install -m 644 "$phase_dir/files/style.css" "$rootfs/usr/share/phase3/files.css"
+install -m 644 "$phase_dir/files/phase3-files.desktop" "$rootfs/usr/share/applications/phase3-files.desktop"
 install -m 644 "$p2_out/source-revision" "$rootfs/etc/phase3-source"
 install -m 644 "$p2_out/kernelrelease" "$rootfs/etc/phase3-kernelrelease"
 units="$rootfs/etc/systemd/system"

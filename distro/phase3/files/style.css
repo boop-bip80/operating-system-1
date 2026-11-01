@@ -1,0 +1,104 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Original Phase 3 Files read-only browser visual style.
+ */
+window.phase3-files-window {
+  font-family: "DejaVu Sans", sans-serif;
+  font-size: 12px;
+  color: #edf5ff;
+  background: #122137;
+}
+
+window.phase3-files-window headerbar {
+  background: #14263c;
+  color: #e5f2ff;
+  border-bottom: 1px solid #496a87;
+  box-shadow: none;
+  min-height: 34px;
+}
+
+.phase3-files-header-button {
+  background: rgba(153, 198, 241, 0.10);
+  color: #d4eaff;
+  border-radius: 8px;
+  border: 1px solid rgba(177, 213, 247, 0.16);
+  box-shadow: none;
+}
+
+.phase3-files-header-button:hover {
+  background: rgba(153, 198, 241, 0.24);
+}
+
+.phase3-files-toolbar {
+  background: #172b45;
+  border-bottom: 1px solid #375471;
+}
+
+.phase3-files-breadcrumb {
+  color: #a9dcff;
+  font-weight: 700;
+}
+
+entry.phase3-files-search {
+  color: #eff7ff;
+  background: #0f1d31;
+  border: 1px solid #678eae;
+  border-radius: 8px;
+  box-shadow: none;
+  padding: 5px 8px;
+}
+
+.phase3-files-list-scroller {
+  background: #13233a;
+  border-right: 1px solid #395777;
+}
+
+list {
+  background: transparent;
+}
+
+row.phase3-files-row {
+  color: #e7f2ff;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+row.phase3-files-row:hover {
+  background: rgba(120, 179, 235, 0.16);
+}
+
+row.phase3-files-row:selected {
+  background: rgba(93, 166, 232, 0.30);
+}
+
+.phase3-files-meta {
+  color: #a8c2d9;
+  font-size: 10px;
+}
+
+.phase3-files-preview-panel {
+  background: #102035;
+}
+
+.phase3-files-preview-title {
+  color: #e5f3ff;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+textview.phase3-files-preview,
+textview.phase3-files-preview text {
+  background: #0d1a2c;
+  color: #d5eaff;
+  font-family: "DejaVu Sans Mono", monospace;
+  font-size: 11px;
+}
+
+.phase3-files-status {
+  color: #a4c2da;
+  font-size: 11px;
+}
+
+checkbutton {
+  color: #d4e7fb;
+}
