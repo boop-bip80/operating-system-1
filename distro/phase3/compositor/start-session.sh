@@ -51,33 +51,42 @@ sway_pid=$!
 tail --lines=+1 --follow=name --retry --sleep-interval=0.1 "$sway_log" &
 sway_tail_pid=$!
 reason=SWAY_READY
-sway_socket=
+# Sway selects a wayland-N display dynamically (wayland-1 in Sway 1.10). Read its *freshly
+# truncated* verbose log, never assume an output name or take a stale socket.
+# Upstream Sway names its IPC socket from its real UID and process PID.
+sway_socket="$XDG_RUNTIME_DIR/sway-ipc.1000.$sway_pid.sock"
+display_name=
 for ((attempt=0;attempt<160;attempt++)); do
     kill -0 "$sway_pid"
-    # Sway sets SWAYSOCK for its children; our supervising parent discovers
-    # that private socket only beneath its own PAM-owned runtime directory.
-    for candidate in "$XDG_RUNTIME_DIR"/sway-ipc.1000.*.sock; do
-        if [[ -S "$candidate" && ! -L "$candidate" ]]; then
-            sway_socket="$candidate"
+    display_name=$(sed -nE "s/.*Running compositor on wayland display '([^']+)'.*/\1/p" "$sway_log" | tail -n 1)
+    if [[ "$display_name" =~ ^wayland-[0-9]+$ ]]; then
+        display_socket="$XDG_RUNTIME_DIR/$display_name"
+        if [[ -S "$sway_socket" && ! -L "$sway_socket" && \
+              -S "$display_socket" && ! -L "$display_socket" ]] && \
+           [[ "$(stat -c %u "$sway_socket")" == 1000 && \
+              "$(stat -c %u "$display_socket")" == 1000 ]] && \
+           SWAYSOCK="$sway_socket" timeout 3 /usr/bin/swaymsg -t get_tree -r >/dev/null 2>&1 && \
+           WAYLAND_DISPLAY="$display_name" timeout 3 /usr/bin/wayland-info >/dev/null 2>&1; then
+            break
         fi
-    done
-    if [[ -n "$sway_socket" && -S "$XDG_RUNTIME_DIR/wayland-0" ]] && \
-       SWAYSOCK="$sway_socket" timeout 3 /usr/bin/swaymsg -t get_tree -r >/dev/null 2>&1 && \
-       WAYLAND_DISPLAY=wayland-0 timeout 3 /usr/bin/wayland-info >/dev/null 2>&1; then
-        break
     fi
     sleep 0.25
 done
 kill -0 "$sway_pid"
-[[ -S "$XDG_RUNTIME_DIR/wayland-0" && -n "$sway_socket" ]]
+[[ "$display_name" =~ ^wayland-[0-9]+$ ]]
+display_socket="$XDG_RUNTIME_DIR/$display_name"
+[[ -S "$sway_socket" && ! -L "$sway_socket" ]]
+[[ -S "$display_socket" && ! -L "$display_socket" ]]
+[[ "$(stat -c %u "$sway_socket")" == 1000 && \
+   "$(stat -c %u "$display_socket")" == 1000 ]]
 SWAYSOCK="$sway_socket" timeout 3 /usr/bin/swaymsg -t get_tree -r >/dev/null
-WAYLAND_DISPLAY=wayland-0 timeout 3 /usr/bin/wayland-info >/dev/null
+WAYLAND_DISPLAY="$display_name" timeout 3 /usr/bin/wayland-info >/dev/null
 [[ "$(awk '/^Uid:/ { print $2 ":" $3 ":" $4 ":" $5 }' "/proc/$sway_pid/status")" == 1000:1000:1000:1000 ]]
 printf 'P3:SWAY_READY\n'
 # Launch only after the real DRM compositor IPC and Wayland display are usable.
 # Unlike a sway.conf exec command this child is supervised; shell disappearance
 # is a hard failure, and a compositor reload cannot spawn duplicate chrome.
-export SWAYSOCK="$sway_socket" WAYLAND_DISPLAY=wayland-0
+export SWAYSOCK="$sway_socket" WAYLAND_DISPLAY="$display_name"
 reason=SHELL_START
 /usr/bin/python3 /usr/lib/phase3/shell.py &
 shell_pid=$!
