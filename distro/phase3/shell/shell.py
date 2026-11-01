@@ -208,7 +208,13 @@ def layout_proof(
             output_rect["y"] + output_rect["height"] - dock_exclusive
         )
     ):
-        raise ValueError("Sway workspace does not exclude topbar and Dock")
+        # These rects have already passed the integer-only _ipc_rect gate.
+        # Include only bounded numeric geometry, never raw Sway window titles,
+        # to diagnose an actually applied layer-shell usable-area mismatch.
+        raise ValueError(
+            f"Sway workspace does not reserve required bar/Dock areas: work={work_rect} "
+            f"output={output_rect} top={top_exclusive} bottom={dock_exclusive}"
+        )
     return {
         "source": "sway.get_outputs+get_workspaces",
         "output": output["name"],
@@ -493,6 +499,9 @@ class Phase3Shell:
         self._launch_requests: list[tuple[float, str]] = []
         self._ready = False
         self._startup_checks = 0
+        # Bounded real startup diagnostics; never imply shell readiness.
+        self._last_startup_warning: float | None = None
+        self._startup_last_failure = "waiting_for_mapped_layer_surfaces"
         self._last_ipc_warning = 0.0
         self._ipc_sequence = 0
         self._launcher_target_generation = 0
@@ -1051,9 +1060,26 @@ class Phase3Shell:
                 emit("PREFERENCE_STATE:compact_dock=" + str(self.preferences["compact_dock"]).lower())
                 self._refresh_dock()
                 return False
-            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
-                pass
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                # Real Sway layout/IPC rejection was previously swallowed for
+                # 30 seconds, obscuring the cause of genuine GUI startup failure.
+                # One bounded stderr line immediately, then at most every 10s.
+                self._startup_last_failure = repr(
+                    f"{type(exc).__name__}: {exc}"
+                )[:180]
+                now = time.monotonic()
+                if (self._last_startup_warning is None or
+                        now - self._last_startup_warning >= 10):
+                    print("phase3: SHELL_READY_WAIT:" + self._startup_last_failure,
+                          file=sys.stderr, flush=True)
+                    self._last_startup_warning = now
         if self._startup_checks >= 120:
+            print("phase3: SHELL_READY_TIMEOUT:"
+                  f"checks={self._startup_checks}:"
+                  f"bar_mapped={self.bar.get_mapped()}:"
+                  f"dock_mapped={self.dock.get_mapped()}:"
+                  f"last={self._startup_last_failure}",
+                  file=sys.stderr, flush=True)
             emit("FAIL:SHELL_STARTUP")
             Gtk.main_quit()
             self._ready = False
