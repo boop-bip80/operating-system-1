@@ -22,6 +22,10 @@ class ArtifactSafety(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="phase3-manifest-test-")
         self.addCleanup(self.tmp.cleanup)
         self.out = Path(self.tmp.name).resolve()
+        # The real verifier requires a source-bound installed package inventory
+        # before checking report status. Keep synthetic fixtures honest so
+        # report-negative tests exercise the intended oracle, not missing inputs.
+        (self.out / "rootfs-packages.tsv").write_text("foot\t1.0\nsway\t1.0\n")
         self.patch = patch.object(manifest, "OUT", self.out)
         self.patch.start()
         self.addCleanup(self.patch.stop)
