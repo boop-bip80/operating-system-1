@@ -50,6 +50,7 @@ ACTIVATED_RE = re.compile(r"P3:WINDOW_ACTIVATED:([1-9][0-9]*)\Z")
 GTK_TARGET_RE = {name: re.compile(r"P3:" + name + r"_TARGET:([0-9]+):([0-9]+):([0-9]+):([0-9]+)\Z")
                  for name in ("COMPACT", "TERMINAL")}
 IPC_PREFIX = "P3:IPC_TREE:"
+LAYOUT_PREFIX = "P3:IPC_LAYOUT:"
 SOURCE_RE = re.compile(r"[0-9a-f]{40}\Z")
 SCREEN_BOX = (160, 75, 864, 680)
 # Sway foot floats centered at 760x530; text/active border begin near x132,y119.
@@ -138,6 +139,106 @@ def gtk_target_from_output(output: str, kind: str) -> tuple[int, int, int, int]:
     return x, y, width, height
 
 
+def ipc_layout_from_output(output: str) -> tuple[int, dict]:
+    """Fail-closed proof of Sway's real output/workarea and GTK exclusive zones.
+
+    This JSON is sourced from Sway get_outputs/get_workspaces and the two
+    mapped GtkLayerShell surfaces, not from a static generated configuration.
+    QMP independently captures the native 1024x768 GPU output afterward.
+    """
+    items = lines(output)
+    evidence = [(index, line[len(LAYOUT_PREFIX):]) for index, line in enumerate(items)
+                if line.startswith(LAYOUT_PREFIX)]
+    if len(evidence) != 1 or not 0 < len(evidence[0][1]) <= 4096:
+        raise Phase3Failure("missing, duplicate or oversized live Sway IPC layout proof")
+    position, payload = evidence[0]
+    try:
+        layout = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise Phase3Failure("live Sway IPC layout is malformed JSON") from exc
+    keys = {"source", "output", "output_rect", "scale", "mode", "workspace",
+            "workspace_rect", "top_exclusive", "dock_exclusive"}
+    if not isinstance(layout, dict) or set(layout) != keys:
+        raise Phase3Failure("Sway IPC layout missing required source-bound fields")
+    if json.dumps(layout, sort_keys=True, separators=(",", ":")) != payload:
+        raise Phase3Failure("Sway IPC layout JSON is not canonical")
+    if (layout["source"] != "sway.get_outputs+get_workspaces" or
+            layout["output"] != "Virtual-1" or layout["workspace"] != "1" or
+            type(layout["scale"]) not in (int, float) or layout["scale"] != 1.0):
+        raise Phase3Failure("Sway IPC output/workspace identity or scale changed")
+    def rect(value: object) -> dict:
+        if (not isinstance(value, dict) or set(value) != {"x", "y", "width", "height"} or
+                any(type(v) is not int for v in value.values())):
+            raise Phase3Failure("Sway IPC rectangle uses invalid coordinates")
+        return value
+    output_rect = rect(layout["output_rect"])
+    workarea = rect(layout["workspace_rect"])
+    mode = layout["mode"]
+    if (not isinstance(mode, dict) or set(mode) != {"width", "height"} or
+            any(type(v) is not int for v in mode.values()) or
+            output_rect != {"x": 0, "y": 0, "width": 1024, "height": 768} or
+            mode != {"width": 1024, "height": 768}):
+        raise Phase3Failure("Sway IPC output geometry does not match native QEMU scanout")
+    top = layout["top_exclusive"]
+    bottom = layout["dock_exclusive"]
+    if (type(top) is not int or type(bottom) is not int or top != 38 or bottom != 68 or
+            workarea["x"] != 0 or workarea["width"] != output_rect["width"] or
+            workarea["height"] <= 0 or workarea["y"] < top or
+            workarea["y"] + workarea["height"] > output_rect["height"] - bottom):
+        raise Phase3Failure("original topbar/Dock did not reserve real Sway workarea")
+    return position, layout
+
+
+def app_index_from_output(output: str) -> tuple[int, dict]:
+    """Audit real Gio desktop IDs separately from GTK-packed launcher rows."""
+    items = lines(output)
+    prefix = "P3:APP_INDEX:"
+    observed = [(i, line[len(prefix):]) for i, line in enumerate(items)
+                if line.startswith(prefix)]
+    if len(observed) != 1 or not 0 < len(observed[0][1]) <= 4096:
+        raise Phase3Failure("missing, duplicated or oversized real Gio app index")
+    position, raw = observed[0]
+    try:
+        index = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise Phase3Failure("Gio app index marker is malformed JSON") from exc
+    if (not isinstance(index, dict) or
+            set(index) != {"source", "eligible_count", "eligible_ids",
+                           "displayed_count", "displayed_ids", "sha256"} or
+            json.dumps(index, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != raw):
+        raise Phase3Failure("Gio app index is not the canonical six-field schema")
+    if index["source"] != "Gio.AppInfo.get_all":
+        raise Phase3Failure("launcher index does not originate in Gio.AppInfo")
+    eligible = index["eligible_ids"]
+    displayed = index["displayed_ids"]
+    eligible_count = index["eligible_count"]
+    displayed_count = index["displayed_count"]
+    def valid_ids(ids: object) -> bool:
+        return (
+            isinstance(ids, list)
+            and all(isinstance(item, str) and len(item) <= 128 and
+                    re.fullmatch(r"[A-Za-z0-9_.+-]+\.desktop", item) is not None
+                    for item in ids)
+            and ids == sorted(set(ids))
+        )
+    if (type(eligible_count) is not int or not 1 <= eligible_count <= 60 or
+            type(displayed_count) is not int or not 0 <= displayed_count <= 60 or
+            not valid_ids(eligible) or not valid_ids(displayed) or
+            len(eligible) != eligible_count or len(displayed) != displayed_count or
+            not set(displayed).issubset(set(eligible)) or
+            "foot.desktop" in displayed or
+            (displayed_count == 0 and "foot.desktop" not in eligible)):
+        raise Phase3Failure("Gio eligible/packed GTK IDs are missing, unsafe or contradictory")
+    canonical = json.dumps(
+        {"displayed_ids": displayed, "eligible_ids": eligible},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if index["sha256"] != expected:
+        raise Phase3Failure("Gio app digest does not bind both eligible and packed rows")
+    return position, index
+
+
 def identity(items: list[str], release: str, source: str) -> None:
     src = exactly_once(items, f"P3:SOURCE:{source}")
     kernel = exactly_once(items, f"P3:KERNEL:{release}")
@@ -161,6 +262,14 @@ def ready(output: str, release: str, source: str, previous: str | None) -> None:
         if [exactly_once(items, value) for value in BOOT_MARKERS] != sorted(
                 exactly_once(items, value) for value in BOOT_MARKERS):
             raise Phase3Failure("shell prerequisites were reported out of order")
+    layout_position, _ = ipc_layout_from_output(output)
+    first_tree = next((index for index, value in enumerate(items)
+                       if value.startswith(IPC_PREFIX)), None)
+    if (first_tree is None or not
+            (exactly_once(items, "P3:SWAY_READY") < first_tree < layout_position <
+             exactly_once(items, "P3:LAYER_SHELL_READY") <
+             exactly_once(items, "P3:SHELL_READY"))):
+        raise Phase3Failure("real Sway tree/layout and GTK reservations were not proved before shell readiness")
     if exactly_once(items, f"P3:PERSISTED:{previous or 'EMPTY'}") >= exactly_once(items, "P3:SHELL_READY"):
         raise Phase3Failure("persistence was not inspected before desktop readiness")
     state = "true" if previous else "false"
@@ -293,8 +402,10 @@ def validate_positive(result: BootResult, release: str, source: str) -> None:
     compact_mark = exactly_once(items, "P3:COMPACT_TARGET:" + ":".join(map(str, compact)))
     terminal_mark = exactly_once(items, "P3:TERMINAL_TARGET:" + ":".join(map(str, terminal)))
     launched = exactly_once(items, "P3:APP_LAUNCHED:foot")
-    if not (exactly_once(items, "P3:SHELL_READY") < opened < compact_mark < terminal_mark < launched):
-        raise Phase3Failure("actual mapped GTK launcher hitboxes were not observed before Terminal")
+    index_mark, _ = app_index_from_output(result.output)
+    if not (exactly_once(items, "P3:SHELL_READY") < opened < compact_mark < terminal_mark <
+            index_mark < launched):
+        raise Phase3Failure("mapped GTK/Gio index and hitboxes were not observed before Terminal")
     if (result.compact_target != list(compact) or
             result.terminal_target != list(terminal) or
             terminal[1] >= compact[1]):
@@ -404,6 +515,12 @@ def validate_positive(result: BootResult, release: str, source: str) -> None:
         hashes.add(proof["sha256"])
     if len(hashes) < 8:
         raise Phase3Failure("QMP snapshots lack distinct genuine application states")
+    # Tie the true DRM mode reported by Sway IPC to the separate, host-read
+    # virtio-GPU QMP scanout before accepting the original shell as visible.
+    mode = ipc_layout_from_output(result.output)[1]["mode"]
+    if ((result.screenshots["ready"]["width"], result.screenshots["ready"]["height"]) !=
+            (mode["width"], mode["height"])):
+        raise Phase3Failure("Sway reserved workarea has no corresponding GPU framebuffer")
 
 def validate_negative(result: BootResult, release: str, source: str) -> None:
     # Phase3 intentionally retains the Phase2 boot-check service. Its real
@@ -421,7 +538,8 @@ def validate_negative(result: BootResult, release: str, source: str) -> None:
     forbidden = ("P3:DRM_OK", "P3:RENDERER_ENV:", "P3:PIXMAN_RENDERER_CREATED",
                  "P3:BACKENDS_ENV:", "P3:DRM_FD:", "P3:DRM_MODESET_REQUESTED:",
                  "P3:SWAY_READY", "P3:LAYER_SHELL_READY", "P3:SHELL_READY",
-                 "P3:LAUNCHER_OPEN", "P3:COMPACT_TARGET:", "P3:TERMINAL_TARGET:",
+                 "P3:IPC_LAYOUT:", "P3:APP_INDEX:", "P3:LAUNCHER_OPEN",
+                 "P3:COMPACT_TARGET:", "P3:TERMINAL_TARGET:",
                  "P3:APP_LAUNCHED", "P3:WINDOW_", "P3:IPC_TREE:", "P3:PROCESS_EXITED:", "P3:KEYBOARD_OK")
     if any(x.startswith(forbidden) for x in items):
         raise Phase3Failure("negative case reached a desktop or used a fallback renderer")
@@ -470,7 +588,8 @@ def validate_shell_negative(result: BootResult, release: str, source: str) -> No
         raise Phase3Failure(f"shell-negative had unexpected guest failures: {failures!r}")
     forbidden = ("P3:LAYER_SHELL_READY", "P3:SHELL_READY",
                  "P3:PREFERENCE_STATE:", "P3:PREFERENCE_SAVED:",
-                 "P3:LAUNCHER_OPEN", "P3:COMPACT_TARGET:", "P3:TERMINAL_TARGET:",
+                 "P3:IPC_LAYOUT:", "P3:APP_INDEX:", "P3:LAUNCHER_OPEN",
+                 "P3:COMPACT_TARGET:", "P3:TERMINAL_TARGET:",
                  "P3:APP_LAUNCHED:", "P3:WINDOW_", "P3:IPC_TREE:", "P3:PROCESS_EXITED:", "P3:KEYBOARD_OK:")
     if any(item.startswith(forbidden) for item in items):
         raise Phase3Failure("broken GTK child reported shell/UI success")
@@ -962,6 +1081,10 @@ def boot(name: str, timeout: float, release: str, source: str,
                           "real mapped GTK Terminal row geometry")
             result.compact_target = list(gtk_target_from_output(monitor.output(), "COMPACT"))
             result.terminal_target = list(gtk_target_from_output(monitor.output(), "TERMINAL"))
+            wait_observed(lambda items: any(item.startswith("P3:APP_INDEX:") for item in items),
+                          "real mapped Gio desktop application index")
+            _, app_index = app_index_from_output(monitor.output())
+            print(f"phase3: {name}: {app_index['displayed_count']} mapped Gio rows from {app_index['eligible_count']} eligible desktop IDs", flush=True)
             if result.terminal_target[1] >= result.compact_target[1]:
                 raise Phase3Failure("GTK Terminal row is not above Compact checkbox")
             print(f"phase3: {name}: two mapped GTK widget hitboxes verified", flush=True)

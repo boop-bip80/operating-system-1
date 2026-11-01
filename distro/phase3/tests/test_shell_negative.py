@@ -124,7 +124,8 @@ class ShellNegativeAcceptance(unittest.TestCase):
     def test_no_shell_readiness_ui_hid_or_other_failure_can_leak(self):
         forbidden = (
             "P3:LAYER_SHELL_READY", "P3:SHELL_READY",
-            "P3:LAUNCHER_OPEN", "P3:COMPACT_TARGET:60:444:92:26",
+            "P3:LAUNCHER_OPEN", "P3:IPC_LAYOUT:{}", "P3:APP_INDEX:{}",
+            "P3:COMPACT_TARGET:60:444:92:26",
             "P3:TERMINAL_TARGET:140:153:248:40",
             "P3:PREFERENCE_STATE:compact_dock=false",
             "P3:PREFERENCE_SAVED:compact_dock=true",
@@ -178,7 +179,8 @@ class ShellNegativeAcceptance(unittest.TestCase):
         for marker in (
             "P3:RENDERER_ENV:pixman", "P3:BACKENDS_ENV:libinput,drm",
             "P3:DRM_FD:card0", "P3:DRM_MODESET_REQUESTED:Virtual-1",
-            "P3:PIXMAN_RENDERER_CREATED",
+            "P3:PIXMAN_RENDERER_CREATED", "P3:IPC_LAYOUT:{}",
+            "P3:APP_INDEX:{}",
             "P3:PROCESS_EXITED:42:20371",
         ):
             with self.subTest(marker=marker):

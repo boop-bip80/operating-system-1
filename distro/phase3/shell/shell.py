@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -35,6 +37,8 @@ LAUNCHER_LEFT = 14
 LAUNCHER_TOP = 43
 LAUNCHER_TARGET_INTERVAL_MS = 75
 LAUNCHER_TARGET_MAX_CHECKS = 120
+# Keep BOTH eligible/displayed Gio ID arrays plus canonical JSON below 4096B.
+APP_INDEX_ID_CHAR_BUDGET = 1600
 MAX_IPC_WINDOWS = 32
 MAX_IPC_SNAPSHOT_BYTES = 4096
 PROCESS_EXIT_TIMEOUT = 8.0
@@ -60,9 +64,22 @@ def sway_ipc(*args: str) -> Any:
         answer = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError("Sway returned non-JSON IPC") from exc
-    if isinstance(answer, list) and any(
-        isinstance(item, dict) and not item.get("success", False)
-        for item in answer
+    # Sway's read-only GET_* replies are JSON data (often arrays of dicts
+    # with NO "success" field), while control commands require an explicit
+    # success=true acknowledgment for every selector-matched container.
+    is_query = len(args) == 2 and args[0] == "-t" and args[1] in (
+        "get_tree", "get_outputs", "get_workspaces",
+    )
+    if is_query:
+        if isinstance(answer, list) and any(
+            isinstance(item, dict) and "success" in item and item["success"] is not True
+            for item in answer
+        ):
+            raise RuntimeError("Sway rejected query: " + repr(answer)[:240])
+    elif (
+        not isinstance(answer, list) or not answer
+        or any(not isinstance(item, dict) or item.get("success") is not True
+               for item in answer)
     ):
         raise RuntimeError("Sway rejected command: " + repr(answer)[:240])
     return answer
@@ -124,6 +141,130 @@ def parse_toplevels(tree: Any) -> dict[int, Toplevel]:
 
     visit(tree)
     return found
+
+
+def _ipc_rect(value: Any) -> dict[str, int]:
+    """Reject incomplete or synthetic geometry before recording Sway proof."""
+    if not isinstance(value, dict):
+        raise ValueError("Sway IPC geometry is not a rectangle")
+    rect = {key: value.get(key) for key in ("x", "y", "width", "height")}
+    if any(type(number) is not int for number in rect.values()):
+        raise ValueError("Sway IPC geometry must contain integer coordinates")
+    if rect["width"] <= 0 or rect["height"] <= 0:
+        raise ValueError("Sway IPC geometry has an empty size")
+    return rect
+
+
+def layout_proof(
+    outputs: Any, workspaces: Any, top_exclusive: int, dock_exclusive: int,
+) -> dict[str, Any]:
+    """Confirm actual compositor workspace geometry reserves both mapped bars.
+
+    A GtkLayerShell getter alone proves only the client request. Sway's
+    get_workspaces rect is derived from its output usable_area after layer
+    exclusive zones, so this combines two independent real runtime APIs.
+    """
+    if type(top_exclusive) is not int or top_exclusive != 38:
+        raise ValueError("topbar did not request a 38-pixel exclusive zone")
+    if type(dock_exclusive) is not int or dock_exclusive != 68:
+        raise ValueError("Dock did not request a 68-pixel exclusive zone")
+    if not isinstance(outputs, list) or not isinstance(workspaces, list):
+        raise ValueError("Sway output/workspace IPC replies must be arrays")
+    active = [item for item in outputs if isinstance(item, dict)
+              and item.get("active") is True]
+    if len(active) != 1 or active[0].get("name") != "Virtual-1":
+        raise ValueError("not exactly one active native virtio output")
+    output = active[0]
+    output_rect = _ipc_rect(output.get("rect"))
+    if output_rect != {"x": 0, "y": 0, "width": 1024, "height": 768}:
+        raise ValueError("Sway output geometry differs from QEMU's 1024x768")
+    scale = output.get("scale")
+    if type(scale) not in (int, float) or scale != 1:
+        raise ValueError("Sway output scale must be 1 for QMP pixel coordinates")
+    if output.get("transform") != "normal":
+        raise ValueError("Sway output transform must be unrotated for QMP coordinates")
+    current_mode = output.get("current_mode")
+    if not isinstance(current_mode, dict):
+        raise ValueError("Sway output has no current DRM mode")
+    mode = {key: current_mode.get(key) for key in ("width", "height")}
+    if any(type(value) is not int for value in mode.values()):
+        raise ValueError("Sway output mode has malformed dimensions")
+    if mode != {"width": 1024, "height": 768}:
+        raise ValueError("Sway DRM output mode differs from tested framebuffer")
+    visible = [item for item in workspaces if isinstance(item, dict)
+               and item.get("visible") is True]
+    if len(visible) != 1 or visible[0].get("output") != "Virtual-1":
+        raise ValueError("not exactly one visible workspace on virtio GPU")
+    workspace = visible[0]
+    workspace_name = workspace.get("name")
+    if not isinstance(workspace_name, str) or not 0 < len(workspace_name) <= 64:
+        raise ValueError("Sway returned a malformed workspace name")
+    work_rect = _ipc_rect(workspace.get("rect"))
+    if not (
+        work_rect["x"] == output_rect["x"]
+        and work_rect["width"] == output_rect["width"]
+        and work_rect["y"] >= output_rect["y"] + top_exclusive
+        and work_rect["y"] + work_rect["height"] <= (
+            output_rect["y"] + output_rect["height"] - dock_exclusive
+        )
+    ):
+        raise ValueError("Sway workspace does not exclude topbar and Dock")
+    return {
+        "source": "sway.get_outputs+get_workspaces",
+        "output": output["name"],
+        "output_rect": output_rect,
+        "scale": float(scale),
+        "mode": mode,
+        "workspace": workspace_name,
+        "workspace_rect": work_rect,
+        "top_exclusive": top_exclusive,
+        "dock_exclusive": dock_exclusive,
+    }
+
+
+def safe_desktop_id(value: Any) -> bool:
+    """Allow loggable XDG desktop IDs, never names, Exec, paths or control bytes."""
+    return (
+        isinstance(value, str) and 0 < len(value) <= 128
+        and re.fullmatch(r"[A-Za-z0-9_.+-]+\.desktop", value) is not None
+    )
+
+
+def app_index_payload(
+    eligible_ids: list[str], displayed_ids: list[str],
+) -> dict[str, Any]:
+    """Bound real Gio inventory and the subset actually packed into GTK rows.
+
+    The builtin Terminal row intentionally replaces foot.desktop in the visible
+    app list, but foot.desktop may still appear in the source-derived eligible
+    inventory. Never invent IDs to cover a missing installed desktop entry.
+    """
+    if not isinstance(eligible_ids, list) or not 1 <= len(eligible_ids) <= 60:
+        raise ValueError("no bounded index of eligible Gio applications")
+    if not isinstance(displayed_ids, list) or len(displayed_ids) > 60:
+        raise ValueError("unbounded displayed Gio launcher rows")
+    if any(not safe_desktop_id(value) for value in [*eligible_ids, *displayed_ids]):
+        raise ValueError("malformed XDG desktop ID in Gio index")
+    if len(set(eligible_ids)) != len(eligible_ids) or len(set(displayed_ids)) != len(displayed_ids):
+        raise ValueError("duplicate XDG desktop ID in Gio index")
+    if not set(displayed_ids).issubset(set(eligible_ids)):
+        raise ValueError("displayed Gio row has no matching installed index entry")
+    if not displayed_ids and "foot.desktop" not in eligible_ids:
+        raise ValueError("empty Gio rows without an actual builtin foot.desktop")
+    eligible = sorted(eligible_ids)
+    displayed = sorted(displayed_ids)
+    canonical_lists = json.dumps(
+        {"eligible_ids": eligible, "displayed_ids": displayed},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    return {
+        "displayed_count": len(displayed),
+        "displayed_ids": displayed,
+        "eligible_count": len(eligible),
+        "eligible_ids": eligible,
+        "sha256": hashlib.sha256(canonical_lists.encode("utf-8")).hexdigest(),
+        "source": "Gio.AppInfo.get_all",
+    }
 
 
 def valid_con_id(con_id: int) -> int:
@@ -426,7 +567,12 @@ class Phase3Shell:
         )
         GtkLayerShell.set_margin(self.launcher, GtkLayerShell.Edge.TOP, LAUNCHER_TOP)
         GtkLayerShell.set_margin(self.launcher, GtkLayerShell.Edge.LEFT, LAUNCHER_LEFT)
-        GtkLayerShell.set_exclusive_zone(self.launcher, 0)
+        # Zone 0 makes Sway move this overlay BELOW the topbar's 38px
+        # exclusive area: a TOP margin of 43 then becomes pixel y=81, while
+        # GTK widget coordinates are relative to the launcher itself. -1
+        # keeps our non-reserving popup anchored to the full output (y=43),
+        # so mapped Gtk.Widget centers match real QMP framebuffer pixels.
+        GtkLayerShell.set_exclusive_zone(self.launcher, -1)
         if hasattr(GtkLayerShell, "set_keyboard_mode"):
             GtkLayerShell.set_keyboard_mode(
                 self.launcher, GtkLayerShell.KeyboardMode.ON_DEMAND
@@ -456,6 +602,9 @@ class Phase3Shell:
         scroll.add_with_viewport(self.app_list)
         body.pack_start(scroll, True, True, 0)
         compact = Gtk.CheckButton(label="Compact Dock")
+        # Keep the clickable GTK allocation around the painted checkbox/label,
+        # not stretched across 348px of otherwise empty launcher space.
+        compact.set_halign(Gtk.Align.START)
         compact.set_active(self.preferences["compact_dock"])
         compact.connect("toggled", self._compact_toggled)
         self.compact_toggle = compact
@@ -482,6 +631,13 @@ class Phase3Shell:
 
     def _fill_launcher(self) -> None:
         self.terminal_row = None
+        # Only rows that are truly packed into the visible Gio section count as
+        # indexed desktop applications; the hand-built Terminal row is separate.
+        self._eligible_ids: list[str] = []
+        self._displayed_ids: list[str] = []
+        eligible: set[str] = set()
+        displayed: set[str] = set()
+        eligible_chars = 0
         for child in self.app_list.get_children():
             self.app_list.remove(child)
         query = self.search.get_text().strip().casefold()
@@ -492,8 +648,6 @@ class Phase3Shell:
             self.app_list.pack_start(button, False, False, 0)
         count = 0
         for app in self.apps:
-            if count >= 60:
-                break
             try:
                 # The installed desktop-entry database is an input boundary:
                 # getters can raise or return malformed types even after
@@ -501,15 +655,29 @@ class Phase3Shell:
                 name = app.get_name()
                 desktop_id = app.get_id() or ""
                 icon = app.get_icon()
-                if not isinstance(name, str) or not name or not isinstance(desktop_id, str):
+                if not isinstance(name, str) or not name or not safe_desktop_id(desktop_id):
                     continue
+                if desktop_id not in eligible:
+                    # The canonical marker includes this ID in eligible AND
+                    # possibly displayed lists. Cap the combined serial size
+                    # deterministically before packing any unbound Gio row.
+                    if (len(eligible) >= 60 or
+                            eligible_chars + len(desktop_id) > APP_INDEX_ID_CHAR_BUDGET):
+                        continue
+                    self._eligible_ids.append(desktop_id)
+                    eligible.add(desktop_id)
+                    eligible_chars += len(desktop_id)
                 if desktop_id.casefold().startswith("foot."):
+                    continue
+                if desktop_id in displayed or count >= 60:
                     continue
                 if query and query not in name.casefold():
                     continue
                 button = self._launcher_row(name, "application-x-executable-symbolic", icon)
                 button.connect("clicked", lambda _btn, item=app: self._launch_desktop_app(item))
                 self.app_list.pack_start(button, False, False, 0)
+                self._displayed_ids.append(desktop_id)
+                displayed.add(desktop_id)
                 count += 1
             except (GLib.Error, AttributeError, TypeError, ValueError):
                 # Skip only this malformed entry; real Gio.AppInfo.launch is
@@ -588,8 +756,22 @@ class Phase3Shell:
         compact = self._launcher_widget_target(self.compact_toggle)
         terminal = self._launcher_widget_target(self.terminal_row)
         if compact is not None and terminal is not None:
+            try:
+                indexed = app_index_payload(self._eligible_ids, self._displayed_ids)
+                index_json = json.dumps(
+                    indexed, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                )
+                if len(index_json.encode("utf-8")) > 4096:
+                    raise ValueError("displayed desktop ID index exceeds 4096 bytes")
+            except ValueError as exc:
+                # Do not advertise a fabricated inventory or clickable controls
+                # when the actual installed Gio rows cannot be audited.
+                print("phase3: launcher index not ready: " + str(exc),
+                      file=sys.stderr, flush=True)
+                return False
             emit("COMPACT_TARGET:" + ":".join(str(value) for value in compact))
             emit("TERMINAL_TARGET:" + ":".join(str(value) for value in terminal))
+            emit("APP_INDEX:" + index_json)
             return False
         if self._launcher_target_checks >= LAUNCHER_TARGET_MAX_CHECKS:
             print("phase3: launcher controls never mapped with valid allocations",
@@ -849,9 +1031,21 @@ class Phase3Shell:
                 if not GtkLayerShell.is_layer_window(self.dock):
                     raise RuntimeError("Dock is not a layer surface")
                 observed = parse_toplevels(sway_ipc("-t", "get_tree"))
+                proof = layout_proof(
+                    sway_ipc("-t", "get_outputs"),
+                    sway_ipc("-t", "get_workspaces"),
+                    GtkLayerShell.get_exclusive_zone(self.bar),
+                    GtkLayerShell.get_exclusive_zone(self.dock),
+                )
+                layout_json = json.dumps(
+                    proof, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                )
+                if len(layout_json.encode("utf-8")) > 512:
+                    raise ValueError("Sway output geometry proof is unbounded")
                 self.toplevels = observed
                 self._ready = True
                 self._record_ipc_snapshot(observed)
+                emit("IPC_LAYOUT:" + layout_json)
                 emit("LAYER_SHELL_READY")
                 emit("SHELL_READY")
                 emit("PREFERENCE_STATE:compact_dock=" + str(self.preferences["compact_dock"]).lower())

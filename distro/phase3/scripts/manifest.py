@@ -203,8 +203,130 @@ def load_smoke():
     return module
 
 
+def check_native_layout(items: list[str]) -> None:
+    """Independent P3-07 workarea oracle from SHA-bound Sway IPC serial bytes.
+
+    GtkLayerShell setter calls alone cannot prove the compositor actually
+    respected exclusive zones. The original shell projects two live Sway IPC
+    replies plus the mapped GTK getters before it declares layer readiness.
+    """
+    prefix = "P3:IPC_LAYOUT:"
+    evidence = [(index, marker[len(prefix):])
+                for index, marker in enumerate(items) if marker.startswith(prefix)]
+    require(len(evidence) == 1, "missing or duplicated native Sway workspace layout proof")
+    position, raw = evidence[0]
+    require(len(raw) <= 1200, "oversized Sway layout IPC evidence")
+    value = json.loads(raw)
+    require(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=True) == raw,
+            "Sway layout marker is not a canonical source-bound IPC projection")
+    require(isinstance(value, dict) and set(value) == {
+        "source", "output", "output_rect", "scale", "mode",
+        "workspace", "workspace_rect", "top_exclusive", "dock_exclusive",
+    }, "malformed or incomplete Sway output/workspace layout projection")
+    require(value["source"] == "sway.get_outputs+get_workspaces" and
+            value["output"] == "Virtual-1" and
+            value["workspace"] == "1",
+            "workarea projection did not originate from the required Sway output/workspace")
+    require(type(value["scale"]) in (int, float) and value["scale"] == 1 and
+            type(value["top_exclusive"]) is int and value["top_exclusive"] == 38 and
+            type(value["dock_exclusive"]) is int and value["dock_exclusive"] == 68,
+            "GTK layer-shell exclusive zones or native Sway output scale mismatch")
+    def rect(name: str) -> dict:
+        result = value[name]
+        require(isinstance(result, dict) and set(result) ==
+                {"x", "y", "width", "height"} and
+                all(type(result[field]) is int for field in ("x", "y", "width", "height")),
+                f"invalid real Sway {name} rectangle")
+        return result
+    output = rect("output_rect")
+    workspace = rect("workspace_rect")
+    mode = value["mode"]
+    require(isinstance(mode, dict) and set(mode) == {"width", "height"} and
+            type(mode["width"]) is int and type(mode["height"]) is int and
+            mode == {"width": 1024, "height": 768} and
+            output == {"x": 0, "y": 0, "width": 1024, "height": 768},
+            "Sway native KMS output geometry/mode mismatch")
+    require(workspace["x"] == output["x"] and
+            workspace["width"] == output["width"] and
+            workspace["y"] >= output["y"] + value["top_exclusive"] and
+            workspace["height"] > 0 and
+            workspace["y"] + workspace["height"] <=
+                output["y"] + output["height"] - value["dock_exclusive"],
+            "real Sway workspace usable rectangle did not reserve top bar and Dock")
+    sway = next((i for i, marker in enumerate(items) if marker == "P3:SWAY_READY"), None)
+    ipc = next((i for i, marker in enumerate(items) if marker.startswith("P3:IPC_TREE:")), None)
+    layer = next((i for i, marker in enumerate(items) if marker == "P3:LAYER_SHELL_READY"), None)
+    shell = next((i for i, marker in enumerate(items) if marker == "P3:SHELL_READY"), None)
+    require(None not in (sway, ipc, layer, shell) and
+            sway < ipc < position < layer < shell,
+            "real Sway applied layout was not observed before GTK layer-shell readiness")
+
+
+def check_native_app_index(items: list[str]) -> None:
+    """Independently bind installed eligible and actually displayed Gio IDs.
+
+    The original shell inventories real Gio.AppInfo entries; the output
+    preserves only sanitized desktop IDs and counts, never names or Exec
+    commands. A mapped pinned foot row is distinct from the Gio row subset.
+    """
+    prefix = "P3:APP_INDEX:"
+    evidence = [(i, marker[len(prefix):])
+                for i, marker in enumerate(items) if marker.startswith(prefix)]
+    require(len(evidence) == 1, "missing/duplicated real Gio application index marker")
+    position, raw = evidence[0]
+    require(0 < len(raw) <= 4096, "unbounded Gio launcher index")
+    value = json.loads(raw)
+    require(isinstance(value, dict) and set(value) ==
+            {"displayed_count", "displayed_ids", "eligible_count", "eligible_ids",
+             "sha256", "source"} and
+            json.dumps(value, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=True) == raw,
+            "malformed or noncanonical native Gio launcher index")
+    eligible = value["eligible_ids"]
+    displayed = value["displayed_ids"]
+    def safe_ids(value: object, lower: int) -> bool:
+        if not isinstance(value, list) or not lower <= len(value) <= 60:
+            return False
+        if not all(isinstance(name, str) and len(name) <= 128 and name.isascii() and
+                   re.fullmatch(r"[A-Za-z0-9_.+-]+[.]desktop", name) is not None
+                   for name in value):
+            return False
+        return value == sorted(set(value))
+    require(value["source"] == "Gio.AppInfo.get_all" and
+            type(value["eligible_count"]) is int and
+            type(value["displayed_count"]) is int and
+            safe_ids(eligible, 1) and safe_ids(displayed, 0) and
+            value["eligible_count"] == len(eligible) and
+            value["displayed_count"] == len(displayed) and
+            set(displayed) <= set(eligible) and "foot.desktop" not in displayed and
+            (len(displayed) > 0 or "foot.desktop" in eligible),
+            "Gio index fails eligible/displayed subset, uniqueness or mapped Terminal fallback")
+    inventory = {"eligible_ids": eligible, "displayed_ids": displayed}
+    canonical = json.dumps(inventory, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True).encode("utf-8")
+    require(isinstance(value["sha256"], str) and
+            re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None and
+            hashlib.sha256(canonical).hexdigest() == value["sha256"],
+            "Gio displayed/eligible desktop ID inventories have a forged digest")
+    opened = next((i for i, item in enumerate(items) if item == "P3:LAUNCHER_OPEN"), None)
+    compact = next((i for i, item in enumerate(items)
+                    if item.startswith("P3:COMPACT_TARGET:")), None)
+    terminal = next((i for i, item in enumerate(items)
+                     if item.startswith("P3:TERMINAL_TARGET:")), None)
+    launched = next((i for i, item in enumerate(items)
+                     if item == "P3:APP_LAUNCHED:foot"), None)
+    require(None not in (opened, compact, terminal, launched) and
+            opened < compact < terminal < position < launched,
+            "real installed Gio launcher index was not captured before the GTK Terminal click")
+
+
 def verify() -> None:
     manifest = check_build()
+    installed = {line.split("\t", 1)[0]
+                 for line in safe_file("rootfs-packages.tsv").read_text().splitlines()}
+    require({"foot", "sway"} <= installed,
+            "native app index lacks the source-bound installed foot/Sway package inventory")
     smoke = load_smoke()
     report = json.loads(safe_file("test-results.json").read_text())
     require(report.get("schema_version") == 1 and report.get("status") == "pass",
@@ -296,6 +418,10 @@ def verify() -> None:
         qmp = safe_file(case["qmp_log"])
         require(case.get("serial_log_sha256") == digest(serial) and
                 case.get("qmp_log_sha256") == digest(qmp), f"{name} evidence hashes differ")
+        if name in ("negative", "shell-negative"):
+            require(not any(marker.startswith(("P3:IPC_LAYOUT:", "P3:APP_INDEX:"))
+                            for marker in smoke.lines(serial.read_text(errors="replace"))),
+                    f"{name} negative control contains a healthy Sway/Gio UI claim")
         result = smoke.BootResult(
             name=name, output=serial.read_text(errors="replace"),
             returncode=case.get("returncode", -1), timed_out=case.get("timed_out", True),
@@ -320,6 +446,8 @@ def verify() -> None:
             require(result.previous_nonce == (first_nonce if name == "round2" else None),
                     f"{name} nonce lineage is broken")
             smoke.validate_positive(result, manifest["kernel_release"], manifest["source_revision"])
+            check_native_layout(smoke.lines(result.output))
+            check_native_app_index(smoke.lines(result.output))
             # Parse the mapped GTK allocations directly from the SHA-bound
             # serial log. The JSON summary cannot supply arbitrary hitboxes
             # even if its QMP event list is otherwise internally consistent.

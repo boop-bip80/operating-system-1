@@ -195,6 +195,7 @@ class ManifestReplayContract(unittest.TestCase):
             "smoke.p2.png_bytes", "smoke.transcript",
             "smoke.popup_menu_target", "smoke.gtk_target_from_output",
             "smoke.prove_compact_dock_visible",
+            "check_native_layout", "check_native_app_index",
         ):
             with self.subTest(validator=needed):
                 self.assertIn(needed, calls)

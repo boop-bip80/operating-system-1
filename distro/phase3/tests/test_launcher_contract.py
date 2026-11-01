@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 from contextlib import redirect_stderr
 import io
+import re
 from pathlib import Path
 import sys
 import types
@@ -96,8 +97,18 @@ def production_methods(apps):
         name="ExtractedPhase3Shell", bases=[], keywords=[],
         body=methods, decorator_list=[],
     )
+    safe_ids = [node for node in tree.body if
+                isinstance(node, ast.FunctionDef) and node.name == "safe_desktop_id"]
+    if len(safe_ids) != 1:
+        raise AssertionError("production XDG desktop-id gate missing")
+    constants = [node for node in tree.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and
+                         target.id == "APP_INDEX_ID_CHAR_BUDGET"
+                         for target in node.targets)]
+    if len(constants) != 1:
+        raise AssertionError("production app-index character budget missing")
     module = ast.fix_missing_locations(
-        ast.Module(body=[shell_class], type_ignores=[]),
+        ast.Module(body=constants + safe_ids + [shell_class], type_ignores=[]),
     )
 
     class AppInfo:
@@ -115,7 +126,7 @@ def production_methods(apps):
     namespace = {
         "Gio": types.SimpleNamespace(AppInfo=AppInfo),
         "GLib": types.SimpleNamespace(Error=FakeGLibError),
-        "sys": sys, "subprocess": forbidden_subprocess,
+        "sys": sys, "subprocess": forbidden_subprocess, "re": re, "Any": object,
     }
     exec(compile(module, str(SHELL), "exec"), namespace)
     return namespace["ExtractedPhase3Shell"]
@@ -223,7 +234,7 @@ class DesktopEntryContract(unittest.TestCase):
         return instance.app_list, launched
 
     def test_fill_launcher_skips_bad_name_id_icon_and_row(self):
-        valid = FakeApp("Editor", desktop_id="org.example.Editor")
+        valid = FakeApp("Editor", desktop_id="org.example.Editor.desktop")
         apps = [
             FakeApp(123), FakeApp("Bad ID", desktop_id=b"bad.desktop"),
             FakeApp("Bad name", name_error=FakeGLibError("invalid")),
@@ -268,8 +279,61 @@ class DesktopEntryContract(unittest.TestCase):
         self.assertIs(instance.terminal_row, instance.app_list.children[0])
         self.assertEqual(instance.terminal_row.name, "Terminal")
 
+    def test_gio_eligible_inventory_and_actually_packed_rows_differ(self):
+        items = [
+            FakeApp("Foot", desktop_id="foot.desktop"),
+            FakeApp("Files", desktop_id="org.example.Files.desktop"),
+            FakeApp("Files duplicate", desktop_id="org.example.Files.desktop"),
+            FakeApp("Broken", desktop_id="../exec.desktop"),
+            FakeApp("Bad row", desktop_id="org.example.Bad.desktop"),
+            FakeApp("Editor", desktop_id="org.example.Editor.desktop"),
+        ]
+        cls = production_methods(items)
+        instance = cls()
+        instance.apps = items
+        instance.search = FakeSearch("")
+        instance.app_list = FakeList()
+        def row(name, *_args):
+            if name == "Bad row":
+                raise ValueError("GTK icon lookup failed")
+            return FakeButton(name)
+        instance._launcher_row = row
+        instance._fill_launcher()
+        self.assertEqual(instance._eligible_ids, [
+            "foot.desktop", "org.example.Files.desktop",
+            "org.example.Bad.desktop", "org.example.Editor.desktop",
+        ])
+        self.assertEqual(instance._displayed_ids, [
+            "org.example.Files.desktop", "org.example.Editor.desktop",
+        ])
+        self.assertEqual([button.name for button in instance.app_list.children],
+                         ["Terminal", "Files", "Editor"])
+
+    def test_real_gio_inventory_caps_eligible_count_and_serial_character_budget(self):
+        cls = production_methods([])
+        for ids in (
+            [f"org.example.App{i:03d}.desktop" for i in range(120)],
+            [f"org.example.{i:03d}." + "a" * 98 + ".desktop" for i in range(80)],
+        ):
+            with self.subTest(input_count=len(ids), id_length=len(ids[0])):
+                instance = cls()
+                instance.apps = [FakeApp(f"App {i}", desktop_id=name)
+                                 for i, name in enumerate(ids)]
+                instance.search = FakeSearch("")
+                instance.app_list = FakeList()
+                instance._launcher_row = lambda name, *_: FakeButton(name)
+                instance._fill_launcher()
+                self.assertLessEqual(len(instance._eligible_ids), 60)
+                self.assertLessEqual(sum(map(len, instance._eligible_ids)), 1600)
+                self.assertEqual(set(instance._eligible_ids),
+                                 set(instance._displayed_ids))
+                self.assertNotIn("foot.desktop", instance._eligible_ids)
+                self.assertEqual(len(instance.app_list.children),
+                                 len(instance._displayed_ids) + 1)
+
     def test_fill_launcher_caps_entries_and_discards_old_rows(self):
-        apps = [FakeApp(f"App {i:02d}") for i in range(80)]
+        apps = [FakeApp(f"App {i:02d}",
+                        desktop_id=f"org.example.App{i:02d}.desktop") for i in range(80)]
         cls = production_methods(apps)
         instance = cls()
         instance.apps = apps

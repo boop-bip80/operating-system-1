@@ -7,6 +7,7 @@ GPU backend proofs, persistent preference, and clean negative controls.
 """
 import importlib.util
 import json
+import hashlib
 from pathlib import Path
 import sys
 import unittest
@@ -24,6 +25,42 @@ RELEASE = "7.3.0-rc7-phase2"
 NONCE = "0123456789abcdef0123456789abcdef"
 PREVIOUS = "f" * 32
 A, B = "371", "372"
+
+LAYOUT = {
+    "source": "sway.get_outputs+get_workspaces",
+    "output": "Virtual-1", "workspace": "1",
+    "output_rect": {"x": 0, "y": 0, "width": 1024, "height": 768},
+    "workspace_rect": {"x": 0, "y": 38, "width": 1024, "height": 662},
+    "mode": {"width": 1024, "height": 768}, "scale": 1.0,
+    "top_exclusive": 38, "dock_exclusive": 68,
+}
+
+
+def layout_marker():
+    return "P3:IPC_LAYOUT:" + json.dumps(LAYOUT, sort_keys=True,
+                                         separators=(",", ":"), ensure_ascii=True)
+
+
+ELIGIBLE = sorted(["foot.desktop", "foot-server.desktop", "footclient.desktop",
+                   "org.example.Files.desktop"])
+DISPLAYED = sorted(["foot-server.desktop", "footclient.desktop",
+                    "org.example.Files.desktop"])
+
+
+def index_marker():
+    ids = {"eligible_ids": ELIGIBLE, "displayed_ids": DISPLAYED}
+    digest = hashlib.sha256(json.dumps(
+        ids, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")).hexdigest()
+    value = {
+        "source": "Gio.AppInfo.get_all",
+        "eligible_count": len(ELIGIBLE), "eligible_ids": ELIGIBLE,
+        "displayed_count": len(DISPLAYED), "displayed_ids": DISPLAYED,
+        "sha256": digest,
+    }
+    return "P3:APP_INDEX:" + json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
 
 
 def node(con_id, *, focused=False, scratch="none", visible=True, pid=None):
@@ -55,11 +92,11 @@ def output(previous=None):
         "P3:DRM_FD:card0", "P3:DRM_MODESET_REQUESTED:Virtual-1",
         "P3:PIXMAN_RENDERER_CREATED",
         "P3:SWAY_READY",
-        snapshot(1, []),
+        snapshot(1, []), layout_marker(),
         "P3:LAYER_SHELL_READY", "P3:SHELL_READY",
         f"P3:PREFERENCE_STATE:compact_dock={state}",
         "P3:LAUNCHER_OPEN", "P3:COMPACT_TARGET:60:444:92:26",
-        "P3:TERMINAL_TARGET:140:153:248:40",
+        "P3:TERMINAL_TARGET:140:153:248:40", index_marker(),
     ]
     if previous is None:
         lines.append("P3:PREFERENCE_SAVED:compact_dock=true")
@@ -183,6 +220,31 @@ class TwoFootPositiveOracle(unittest.TestCase):
         )
         self.assertRejects(result)
 
+    def test_real_gio_eligible_and_packed_launcher_index_is_source_bound(self):
+        marker = index_marker()
+        for changed in (
+            "",
+            marker.replace('"source":"Gio.AppInfo.get_all"',
+                           '"source":"host.synthetic"'),
+            marker.replace('"eligible_count":4', '"eligible_count":5'),
+            marker.replace('"displayed_count":3', '"displayed_count":2'),
+            marker.replace('"sha256":"', '"sha256":"bad'),
+        ):
+            with self.subTest(changed=changed[:120]):
+                result = positive()
+                result.output = result.output.replace(marker + "\n",
+                                                      changed + "\n", 1)
+                self.assertRejects(result)
+        result = positive()
+        result.output += marker + "\n"
+        self.assertRejects(result)
+        result = positive()
+        result.output = result.output.replace(
+            "P3:TERMINAL_TARGET:140:153:248:40\n" + marker,
+            marker + "\nP3:TERMINAL_TARGET:140:153:248:40",
+        )
+        self.assertRejects(result)
+
     def test_second_boot_preference_or_nonce_regression_rejected(self):
         result = positive(PREVIOUS)
         result.output = result.output.replace(
@@ -233,6 +295,29 @@ class TwoFootPositiveOracle(unittest.TestCase):
                 result = positive()
                 result.output = result.output.replace(search, replacement, count)
                 self.assertRejects(result)
+
+    def test_native_sway_layer_shell_layout_is_required_and_unforged(self):
+        marker = layout_marker()
+        for changed in (
+            "", marker.replace('"y":38', '"y":0'),
+            marker.replace('"height":662', '"height":768'),
+            marker.replace('"source":"sway.get_outputs+get_workspaces"',
+                           '"source":"synthetic.geometry"'),
+        ):
+            with self.subTest(change=changed):
+                result = positive()
+                result.output = result.output.replace(marker + "\n",
+                                                      changed + "\n", 1)
+                self.assertRejects(result)
+        result = positive()
+        result.output += marker + "\n"
+        self.assertRejects(result)
+        result = positive()
+        result.output = result.output.replace(
+            snapshot(1, []) + "\n" + marker,
+            marker + "\n" + snapshot(1, []),
+        )
+        self.assertRejects(result)
 
     def test_initial_focus_must_have_focused_sway_tree_before_keyboard(self):
         result = positive()
