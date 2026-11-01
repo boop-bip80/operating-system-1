@@ -118,6 +118,12 @@ def ensure_source() -> tuple[str, bool, str]:
     return sha, dirty, sha + ("-dirty" if dirty else "")
 
 
+def verify_inputs_lock() -> None:
+    """Validate the root-staged immutable input without changing ownership or bytes."""
+    require(safe_file("inputs.lock").read_bytes() == (PHASE / "inputs.lock").read_bytes(),
+            "staged Phase3 dependency lock differs from checked-out source")
+
+
 def create() -> None:
     sha, dirty, revision = ensure_source()
     fingerprint = source_fingerprint()
@@ -125,7 +131,10 @@ def create() -> None:
             "source changed since kernel build; rebuild phase3")
     require(safe_file("source-revision").read_text().strip() == revision,
             "image source revision differs from checkout")
-    safe_file("inputs.lock", missing=True).write_bytes((PHASE / "inputs.lock").read_bytes())
+    # Phase 3's privileged rootfs staging already copied this exact lock into
+    # the output tree. It is root-owned by design: acceptance (run unprivileged)
+    # must verify immutable bytes, never attempt to overwrite them.
+    verify_inputs_lock()
     outputs = {key: record(path) for key, path in FILES.items()}
     packages = safe_file("rootfs-packages.tsv").read_text()
     for required in ("sway\t", "foot\t", "python3-gi\t"):
@@ -175,8 +184,7 @@ def check_build() -> dict:
     require(set(manifest.get("outputs", {})) == set(FILES), "incorrect Phase3 output set")
     for key, relative in FILES.items():
         check_record(manifest["outputs"][key], relative)
-    require(safe_file("inputs.lock").read_bytes() == (PHASE / "inputs.lock").read_bytes(),
-            "locked dependencies changed after build")
+    verify_inputs_lock()
     check_record(manifest["host_packages"], "logs/host-packages.log")
     required_lines = {f"{entry['sha256']}  {entry['path']}"
                       for entry in list(manifest["outputs"].values()) + [manifest["host_packages"]]}

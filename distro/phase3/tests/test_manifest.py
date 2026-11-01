@@ -33,6 +33,31 @@ class ArtifactSafety(unittest.TestCase):
         self.assertEqual(record["bytes"], 13)
         manifest.check_record(record, "proof.log")
 
+    def _locked_inputs(self, staged: bytes, source: bytes):
+        original = self.out / "inputs.lock"
+        original.write_bytes(staged)
+        original.chmod(0o444)
+        source_dir = self.out / "source"
+        source_dir.mkdir(exist_ok=True)
+        (source_dir / "inputs.lock").write_bytes(source)
+        before = original.stat()
+        return original, source_dir, (before.st_mtime_ns, before.st_mode & 0o777, original.read_bytes())
+
+    def test_matching_read_only_root_staged_lock_is_never_rewritten(self):
+        original, phase, before = self._locked_inputs(b"immutable-pinned-input\n", b"immutable-pinned-input\n")
+        with patch.object(manifest, "PHASE", phase):
+            manifest.verify_inputs_lock()
+        after = original.stat()
+        self.assertEqual((after.st_mtime_ns, after.st_mode & 0o777, original.read_bytes()), before)
+
+    def test_mismatched_read_only_lock_fails_without_modifying_bytes(self):
+        original, phase, before = self._locked_inputs(b"old-root-owned-input\n", b"new-source-input\n")
+        with patch.object(manifest, "PHASE", phase):
+            with self.assertRaisesRegex(ValueError, "dependency lock differs"):
+                manifest.verify_inputs_lock()
+        after = original.stat()
+        self.assertEqual((after.st_mtime_ns, after.st_mode & 0o777, original.read_bytes()), before)
+
     def test_mutated_bytes_fail_closed(self):
         file = self.out / "proof.log"
         file.write_text("original")
