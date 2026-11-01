@@ -23,18 +23,19 @@ STAGES = (
 )
 CASE_NAMES = ("round1", "round2", "negative", "shell-negative")
 EXPECTED_ROIS = {
-    ("ready", "foot", "SCREEN_BOX", .07),
-    ("ready", "launcher", "LAUNCHER_BOX", .015),
-    ("launcher", "preferences", "DOCK_ICON_BOX", .025),
-    ("ready", "preferences", "LAUNCHER_BOX", .015),
-    ("saved", "second", "FOOT_CONTENT_BOX", .001),
-    ("second", "focused", "FOOT_CONTENT_BOX", .001),
-    ("focused", "menu_minimize", "MENU_POPUP_BOX", .003),
-    ("focused", "hidden", "FOOT_CONTENT_BOX", .001),
-    ("hidden", "restored", "FOOT_CONTENT_BOX", .001),
-    ("restored", "menu_close", "MENU_POPUP_BOX", .003),
-    ("restored", "closed", "FOOT_CONTENT_BOX", .001),
-    ("closed", "desktop", "SCREEN_BOX", .07),
+    ("ready", "foot", "SCREEN_BOX", .07, 18),
+    ("ready", "foot", "SCREEN_BOX", .005, 25),  # independent real terminal glyph/border detail
+    ("ready", "launcher", "LAUNCHER_BOX", .015, 25),
+    ("launcher", "preferences", "DOCK_ICON_BOX", .025, 25),
+    ("ready", "preferences", "LAUNCHER_BOX", .015, 25),
+    ("saved", "second", "FOOT_CONTENT_BOX", .001, 25),
+    ("second", "focused", "FOOT_CONTENT_BOX", .001, 25),
+    ("focused", "menu_minimize", "MENU_POPUP_BOX", .003, 25),
+    ("focused", "hidden", "FOOT_CONTENT_BOX", .001, 25),
+    ("hidden", "restored", "FOOT_CONTENT_BOX", .001, 25),
+    ("restored", "menu_close", "MENU_POPUP_BOX", .003, 25),
+    ("restored", "closed", "FOOT_CONTENT_BOX", .001, 25),
+    ("closed", "desktop", "SCREEN_BOX", .07, 18),
 }
 SMOKE_FRAME_ALIASES = {
     "first": "ready", "launcher": "launcher", "preferences": "preferences",
@@ -93,16 +94,20 @@ def roi_requirements(method, expected_op):
             continue
         first, second = (frame_stage(arg) for arg in call.args)
         box = "SCREEN_BOX"
+        pixel_delta = 25
         for kw in call.keywords:
-            if kw.arg != "box":
-                raise AssertionError("unexpected screenshot ROI option")
-            if not isinstance(kw.value, (ast.Name, ast.Attribute)):
-                raise AssertionError("unbounded screenshot ROI")
-            box = kw.value.id if isinstance(kw.value, ast.Name) else kw.value.attr
+            if kw.arg == "box":
+                if not isinstance(kw.value, (ast.Name, ast.Attribute)):
+                    raise AssertionError("unbounded screenshot ROI")
+                box = kw.value.id if isinstance(kw.value, ast.Name) else kw.value.attr
+            elif kw.arg == "pixel_delta":
+                pixel_delta = ast.literal_eval(kw.value)
+            else:
+                raise AssertionError("unexpected screenshot metric option")
         minimum = ast.literal_eval(node.comparators[0])
-        if type(minimum) is not float:
-            raise AssertionError("nonliteral screenshot threshold")
-        checks.add((first, second, box, minimum))
+        if type(minimum) is not float or type(pixel_delta) is not int:
+            raise AssertionError("nonliteral screenshot or pixel threshold")
+        checks.add((first, second, box, minimum, pixel_delta))
     return checks
 
 
@@ -129,7 +134,15 @@ def capture_roi_requirements(method):
         if roi is None:
             raise AssertionError("nonliteral dynamic screenshot ROI")
         minimum = ast.literal_eval(opts["min_changed"])
-        checks.add((before, stage, roi, minimum))
+        delta = ast.literal_eval(opts["pixel_delta"]) if "pixel_delta" in opts else 25
+        if type(minimum) is not float or type(delta) is not int:
+            raise AssertionError("unbounded QMP screenshot color difference")
+        checks.add((before, stage, roi, minimum, delta))
+        if "min_high_contrast_changed" in opts:
+            high_contrast = ast.literal_eval(opts["min_high_contrast_changed"])
+            if type(high_contrast) is not float or high_contrast <= 0:
+                raise AssertionError("missing positive high-contrast detail floor")
+            checks.add((before, stage, roi, high_contrast, 25))
     return checks
 
 
@@ -288,6 +301,95 @@ class ManifestReplayContract(unittest.TestCase):
         self.assertGreater(changed(before, after, box=boxes["FOOT_CONTENT_BOX"]), 0)
         self.assertEqual(changed(before, after, box=boxes["MENU_POPUP_BOX"]), 0)
 
+
+    def test_dark_real_foot_pixels_need_broad_change_and_independent_detail(self):
+        smoke, _ = parsed()
+        metric = function(smoke, "changed_fraction")
+        namespace = {
+            "p2": types.SimpleNamespace(Frame=types.SimpleNamespace),
+            "Phase3Failure": RuntimeError,
+            "SCREEN_BOX": (160, 75, 864, 680),
+        }
+        module = ast.fix_missing_locations(ast.Module(body=[metric], type_ignores=[]))
+        exec(compile(module, str(SMOKE), "exec"), namespace)
+        changed = namespace["changed_fraction"]
+        Frame = types.SimpleNamespace
+        width, height = 1024, 768
+        original = bytes((21, 36, 55)) * (width * height)
+        baseline = Frame(width=width, height=height, pixels=original)
+        # A large dark foot canvas differs from the real dark wallpaper by
+        # only max-channel 19. Broad GPU area should pass 18 but not 25.
+        tinted = bytearray(original)
+        fill = bytes((40, 55, 74)) * 500
+        for y in range(145, 565):
+            start = (y * width + 200) * 3
+            tinted[start:start + len(fill)] = fill
+        flat = Frame(width=width, height=height, pixels=bytes(tinted))
+        self.assertGreaterEqual(changed(baseline, flat, pixel_delta=18), .07)
+        self.assertEqual(changed(baseline, flat), 0.0)
+        # A flat-tinted rectangle is not sufficient: actual foot text/borders
+        # add independently visible >25 high-contrast detail.
+        detailed = bytearray(tinted)
+        for y in range(161, 520, 8):
+            for x in range(224, 680, 8):
+                start = (y * width + x) * 3
+                detailed[start:start + 3] = bytes((100, 110, 140))
+        terminal = Frame(width=width, height=height, pixels=bytes(detailed))
+        self.assertGreaterEqual(changed(baseline, terminal, pixel_delta=18), .07)
+        self.assertGreaterEqual(changed(baseline, terminal), .005)
+        # No change and a clock-only scanline are never a foot window.
+        self.assertEqual(changed(baseline, baseline, pixel_delta=18), 0)
+        clock = bytearray(original)
+        for y in range(12, 37):
+            for x in range(920, 1010):
+                start = (y * width + x) * 3
+                clock[start:start + 3] = bytes((250, 250, 250))
+        clock_only = Frame(width=width, height=height, pixels=bytes(clock))
+        self.assertEqual(changed(baseline, clock_only, pixel_delta=18), 0)
+        self.assertEqual(changed(baseline, clock_only), 0)
+
+    def test_capture_gate_retries_both_dark_palette_and_high_contrast(self):
+        smoke, manifest = parsed()
+        gate = function(smoke, "capture")
+        comparisons = [
+            node for node in ast.walk(gate) if isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Call)
+            and dotted_name(node.left.func) == "changed_fraction"
+        ]
+        self.assertEqual(len(comparisons), 2)
+        bound_names = set()
+        for node in comparisons:
+            self.assertEqual(len(node.ops), 1)
+            self.assertIsInstance(node.ops[0], ast.Lt)
+            self.assertEqual(len(node.comparators), 1)
+            self.assertIsInstance(node.comparators[0], ast.Name)
+            bound_names.add(node.comparators[0].id)
+            self.assertEqual(len(node.left.args), 2)
+            self.assertEqual([arg.id for arg in node.left.args
+                              if isinstance(arg, ast.Name)],
+                             ["changed_from", "frame"])
+        self.assertEqual(bound_names, {"min_changed", "min_high_contrast_changed"})
+        first_foot = [
+            node for node in ast.walk(function(smoke, "boot"))
+            if isinstance(node, ast.Call) and
+            dotted_name(node.func) == "capture" and
+            len(node.args) >= 3 and
+            isinstance(node.args[2], ast.Constant) and node.args[2].value == "foot"
+        ]
+        self.assertEqual(len(first_foot), 1)
+        options = {kw.arg: ast.literal_eval(kw.value) for kw in first_foot[0].keywords
+                   if kw.arg in ("min_changed", "pixel_delta", "min_high_contrast_changed")}
+        self.assertEqual(options, {
+            "min_changed": .07, "pixel_delta": 18,
+            "min_high_contrast_changed": .005,
+        })
+        online = roi_requirements(function(smoke, "boot"), ast.Lt) | capture_roi_requirements(
+            function(smoke, "boot"))
+        offline = roi_requirements(function(manifest, "verify"), ast.GtE)
+        self.assertEqual(online, offline)
+        self.assertIn(("ready", "foot", "SCREEN_BOX", .07, 18), offline)
+        self.assertIn(("ready", "foot", "SCREEN_BOX", .005, 25), offline)
+        self.assertIn(("closed", "desktop", "SCREEN_BOX", .07, 18), offline)
 
     def test_compact_icon_crossboot_proof_requires_smaller_bright_gpu_region(self):
         smoke, manifest = parsed()

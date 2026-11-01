@@ -616,7 +616,7 @@ def validate_shell_negative(result: BootResult, release: str, source: str) -> No
         raise Phase3Failure("shell-negative attempted a positive GUI/HID/QMP flow")
 
 
-def changed_fraction(a: p2.Frame, b: p2.Frame, box=SCREEN_BOX) -> float:
+def changed_fraction(a: p2.Frame, b: p2.Frame, box=SCREEN_BOX, *, pixel_delta: int = 25) -> float:
     if (a.width, a.height) != (b.width, b.height):
         raise Phase3Failure("compared frames have different dimensions")
     x1, y1, x2, y2 = box
@@ -627,7 +627,7 @@ def changed_fraction(a: p2.Frame, b: p2.Frame, box=SCREEN_BOX) -> float:
             start = (y * a.width + x) * 3
             before = a.pixels[start:start+3]
             after = b.pixels[start:start+3]
-            different += max(abs(before[i]-after[i]) for i in range(3)) > 25
+            different += max(abs(before[i]-after[i]) for i in range(3)) > pixel_delta
             count += 1
     return different / count
 
@@ -821,7 +821,8 @@ class Phase3Monitor(p2.SerialMonitor):
 
 def capture(qmp: p2.QMP, name: str, stage: str, deadline: float, *,
             changed_from: p2.Frame | None = None, box=SCREEN_BOX,
-            min_changed: float = 0.0,
+            min_changed: float = 0.0, pixel_delta: int = 25,
+            min_high_contrast_changed: float = 0.0,
             popup_operation: str | None = None) -> tuple[dict, p2.Frame]:
     """Capture real QMP scanout; retry until UI transition is actually visible.
 
@@ -834,6 +835,8 @@ def capture(qmp: p2.QMP, name: str, stage: str, deadline: float, *,
     """
     if popup_operation is not None and changed_from is None:
         raise ValueError("GTK popup calibration needs its preceding QEMU frame")
+    if min_high_contrast_changed and changed_from is None:
+        raise ValueError("high-contrast GPU proof needs its preceding QEMU frame")
     path = OUT / "screenshots" / f"{name}-{stage}.ppm"
     png = path.with_suffix(".png")
     p2.safe_file(path, must_exist=False)
@@ -847,8 +850,12 @@ def capture(qmp: p2.QMP, name: str, stage: str, deadline: float, *,
             frame = p2.parse_ppm(path.read_bytes())
             verify_frame(frame, stage)
             if changed_from is not None and (
-                    changed_fraction(changed_from, frame, box=box) < min_changed):
+                    changed_fraction(changed_from, frame, box=box,
+                                     pixel_delta=pixel_delta) < min_changed):
                 raise Phase3Failure("QMP GPU pixels have not changed for " + stage)
+            if min_high_contrast_changed and changed_fraction(
+                    changed_from, frame, box=box) < min_high_contrast_changed:
+                raise Phase3Failure("QMP GPU lacks high-contrast detail for " + stage)
             if popup_operation is not None:
                 # GTK may draw Dock hover long before its xdg_popup appears.
                 # Retry real screendumps until the actual CSS menu is mapped.
@@ -1129,10 +1136,16 @@ def boot(name: str, timeout: float, release: str, source: str,
             result.window_id = next(DISCOVERED_RE.fullmatch(x).group(1)
                                     for x in lines(monitor.output()) if DISCOVERED_RE.fullmatch(x))
             monitor.wait_marker(f"P3:WINDOW_FOCUSED:{result.window_id}")
+            # Foot's dark #242424 canvas differs from wallpaper #152437 by
+            # only 19 RGB units. Require broad rendered area plus genuine
+            # high-contrast terminal detail; retry QMP until BOTH appear.
             result.screenshots["foot"], opened = capture(
-                client, name, "foot", deadline, changed_from=first, min_changed=.07)
-            if changed_fraction(first, opened) < .07:
+                client, name, "foot", deadline, changed_from=first,
+                min_changed=.07, pixel_delta=18, min_high_contrast_changed=.005)
+            if changed_fraction(first, opened, pixel_delta=18) < .07:
                 raise Phase3Failure("launcher Terminal did not change real framebuffer")
+            if changed_fraction(first, opened) < .005:
+                raise Phase3Failure("launcher Terminal GPU frame lacks high-contrast detail")
 
             enter_text(client, "p3save " + result.nonce)
             result.keyboard_sent = True
@@ -1259,10 +1272,12 @@ def boot(name: str, timeout: float, release: str, source: str,
             enter_text(client, "exit")
             result.exit_sent = True
             monitor.wait_marker(f"P3:WINDOW_CLOSED:{result.second_window_id}")
+            # A dark foot window disappearing exposes wallpaper with a
+            # 19-unit max-channel contrast; keep the broad 7% area proof.
             result.screenshots["desktop"], desktop = capture(
                 client, name, "desktop", deadline, changed_from=closed,
-                min_changed=.07)
-            if changed_fraction(closed, desktop) < .07:
+                min_changed=.07, pixel_delta=18)
+            if changed_fraction(closed, desktop, pixel_delta=18) < .07:
                 raise Phase3Failure("second foot did not visibly exit")
             client.execute("system_powerdown")
             result.powerdown_sent = True

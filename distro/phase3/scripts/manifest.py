@@ -506,8 +506,15 @@ def verify() -> None:
                 require(smoke.changed_fraction(frames["ready"], frames["preferences"],
                                                box=smoke.LAUNCHER_BOX) >= .015,
                         "second boot did not visibly display the GTK launcher")
-            require(smoke.changed_fraction(frames["ready"], frames["foot"]) >= .07,
-                    "real foot window did not change the framebuffer")
+            # Recompute the exact two-tier real-foot scanout oracle over
+            # independently SHA-bound PPM bytes. Dark foot canvas differs
+            # from wallpaper by 19 max-channel RGB units, while terminal
+            # glyphs/borders provide additional >25 high-contrast detail.
+            require(smoke.changed_fraction(frames["ready"], frames["foot"],
+                                           pixel_delta=18) >= .07,
+                    "real foot window did not change at least 7% of framebuffer")
+            require(smoke.changed_fraction(frames["ready"], frames["foot"]) >= .005,
+                    "real foot framebuffer lacks high-contrast terminal details")
             require(smoke.changed_fraction(
                 frames["saved"], frames["second"],
                 box=smoke.FOOT_CONTENT_BOX) >= .001,
@@ -536,7 +543,8 @@ def verify() -> None:
                 frames["restored"], frames["closed"],
                 box=smoke.FOOT_CONTENT_BOX) >= .001,
                     "Dock Close did not remove its target from the real foot pixels")
-            require(smoke.changed_fraction(frames["closed"], frames["desktop"]) >= .07,
+            require(smoke.changed_fraction(frames["closed"], frames["desktop"],
+                                           pixel_delta=18) >= .07,
                     "surviving terminal did not visibly exit")
             # A self-consistent forged coordinates/QMP transcript is insufficient:
             # independently infer both real GTK popup rows from the exact
