@@ -9,6 +9,7 @@ sway_tail_pid=
 events_tail_pid=
 shell_pid=
 failed() { trap - ERR; printf 'P3:FAIL:%s\n' "$reason"; exit 1; }
+# shellcheck disable=SC2317,SC2329 # Invoked by EXIT trap, including TERM handling.
 cleanup() {
     trap - EXIT
     for pid in "$shell_pid" "$sway_pid" "$sway_tail_pid" "$events_tail_pid"; do

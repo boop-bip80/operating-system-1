@@ -10,8 +10,10 @@ p2_out="$repo_root/.build/phase2"
 p3_out="$repo_root/.build/phase3"
 rootfs="$p2_out/rootfs"
 # shellcheck source=../inputs.lock
+# shellcheck disable=SC1091 # Trusted, exact repository lock file at runtime.
 source "$phase_dir/inputs.lock"
 # shellcheck source=../../phase2/inputs.lock
+# shellcheck disable=SC1091 # Trusted, exact repository lock file at runtime.
 source "$repo_root/distro/phase2/inputs.lock"
 [[ "$PHASE3_DEBIAN_SUITE" == "$DEBIAN_SUITE" && "$PHASE3_DEBIAN_SNAPSHOT" == "$DEBIAN_SNAPSHOT" ]]
 for dir in "$repo_root/.build" "$p2_out" "$p3_out" "$rootfs"; do
@@ -30,7 +32,10 @@ done
 }
 grep -Fq "$DEBIAN_MIRROR" "$rootfs/etc/apt/sources.list"
 grep -Fq "$DEBIAN_SECURITY_MIRROR" "$rootfs/etc/apt/sources.list"
-! grep -Eq '(trusted=yes|allow-unauthenticated)' "$rootfs/etc/apt/sources.list"
+if grep -Eq '(trusted=yes|allow-unauthenticated)' "$rootfs/etc/apt/sources.list"; then
+    echo 'phase3: unsafe unauthenticated APT sources' >&2
+    exit 1
+fi
 for required in chroot install readlink dpkg-query sha256sum; do
     command -v "$required" >/dev/null || { echo "phase3: missing $required" >&2; exit 1; }
 done
@@ -78,6 +83,7 @@ install -d -m 700 -o 1000 -g 1000 "$rootfs/home/desktop/.local/state/phase3"
 chmod 644 "$rootfs/var/log/phase3/session.log"
 # Preserve exact installed binary and source package versions for the P3
 # manifest. P2's older package inventory must not be reused after overlay.
+# shellcheck disable=SC2016 # dpkg-query expands these placeholders inside the guest.
 chroot "$rootfs" dpkg-query -W \
     '-f=${binary:Package}\t${Version}\t${Architecture}\t${source:Package}\t${source:Version}\n' \
     | LC_ALL=C sort > "$p3_out/rootfs-packages.tsv"

@@ -57,23 +57,23 @@ chmod 600 "$firmware"
 # Each boot gets independent writable firmware state, including persistence
 # round two, while preserving the same guest disk overlay.
 args=(
-    -machine q35,accel=tcg -cpu qemu64 -m 2048 -smp 2
+    -machine "q35,accel=tcg" -cpu qemu64 -m 2048 -smp 2
     -drive "if=pflash,format=raw,readonly=on,file=$out/ovmf-code.fd"
     -drive "if=pflash,format=raw,file=$firmware"
     -drive "if=none,id=root,format=qcow2,file=$disk"
-    -device virtio-blk-pci,drive=root
+    -device "virtio-blk-pci,drive=root"
     -vga none
     -device virtio-keyboard-pci -device virtio-tablet-pci
-    -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+    -netdev "user,id=net0" -device "virtio-net-pci,netdev=net0"
     -display none
     -qmp "unix:$qmp,server=on,wait=off"
     -monitor none -no-reboot
 )
 if [[ "$mode" != negative ]]; then
-    args+=( -device virtio-gpu-pci,xres=1024,yres=768 )
+    args+=( -device "virtio-gpu-pci,xres=1024,yres=768" )
 fi
 if [[ "$mode" == test ]]; then
-    args+=( -fw_cfg name=opt/phase3/test,string=1 )
+    args+=( -fw_cfg "name=opt/phase3/test,string=1" )
 fi
 if [[ -n "$vnc" ]]; then
     args+=( -vnc "127.0.0.1:$vnc" )
